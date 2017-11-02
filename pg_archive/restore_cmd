@@ -1,0 +1,65 @@
+#!/bin/bash
+
+pmax=4
+local_dir=/var/local/WALs
+only_local=                # use WALs only from local_dir, do not read it from NFS
+
+delay_time="$4"
+
+if [ -f /etc/default/restore_cmd ]; then
+    . /etc/default/restore_cmd
+fi
+
+set -e
+
+src_dir="$1"
+fname="$2"
+dst_file="$3"
+
+if [ -z "$src_dir" -o -z "$fname" -o -z "$dst_file" ]; then
+    echo -e "usage: restore_cmd SRC-DIR SRC-WAL-FILENAME DST-WAL-FILENAME-WITH-PATH [DELAY-SECONDS]\n" \
+	"\n" \
+	"SRC-DIR                    - archive directory with WALs\n" \
+	"SRC-WAL-FILENAME           - %f (file name)\n" \
+	"DST-WAL-FILENAME-WITH-PATH - %p (file name with path)\n"
+	"DELAY-SECONDS              - copy WAL file only if it older than this seconds\n"
+    exit 1
+fi
+
+if [ -d "$local_dir" ] && [ -f "$local_dir"/"$fname" ]; then
+    src_dir="$local_dir"
+fi
+
+if [ "$only_local" ] && [ "$src_dir" != "$local_dir" ]; then
+    # src_dir set to local_dir above, if not - requested WAL file does not exist in local_dir, exit now
+    exit 1
+fi
+
+if [ "$delay_time" ] && [ "$delay_time" -gt 0 ]; then
+    if [ -f "$src_dir"/"$fname" ]; then
+	ftime="$(stat -c %Y "$src_dir"/"$fname")"
+	apply_time="$(date --date="now - $delay_time seconds" +%s)"
+	if [ "$ftime" -gt "$apply_time" ]; then
+	    # file is too new, skip it, replay it only after $delay_time seconds
+	    # show message only sometimes
+	    if [ $(( (ftime - apply_time) % (10 * 60) )) -lt 3 ]; then
+		echo "file '$fname' is too new ($((ftime - apply_time))s), skip it"
+	    fi
+	    exit 1
+	fi
+    fi
+fi
+
+cp "$src_dir"/"$fname" "$dst_file"
+
+mime=$(file -m /etc/postgresql-common/compress.mime.mgc -b --mime-type "$dst_file")
+
+if [ "$mime" = "application/x-bzip2" ]; then
+    pbzip2 -p"$pmax" -d < "$dst_file" > "$dst_file".bz2-tmp
+    mv "$dst_file".bz2-tmp "$dst_file"
+elif [ "$mime" = "application/x-gzip" ]; then
+    gunzip < "$dst_file" > "$dst_file".gz-tmp
+    mv "$dst_file".gz-tmp "$dst_file"
+fi
+
+exit 0

@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -e
+
+dst_dir="$1"
+fname="$2"
+ftime="$3"
+log_dir=$(dirname "$dst_dir")
+
+if [ -z "$dst_dir" -o -z "$fname" ]; then
+    echo -e "usage: archive_remote_cmd DST-DIR DST-WAL-FILENAME SRC-FILE-TIMESTAMP\n" \
+	"\n" \
+	"DST-DIR                    - archive directory for WALs\n" \
+	"DST-WAL-FILENAME           - %f (file name)\n" \
+	"SRC-FILE-TIMESTAMP         - date and time of src WAL file in 'touch --date' format\n"
+    exit 1
+fi
+
+if [ -f "$dst_dir"/"$fname" ]; then
+    echo "ERROR: $dst_dir/$fname already exist"
+    exit 1
+fi
+if [ -f "$dst_dir"/"$fname".tmp ]; then
+    echo "ERROR: $dst_dir/$fname.tmp already exist"
+    exit 1
+fi
+
+echo "$fname" > "$log_dir"/LASTLOG
+# что бы не обрабатывать ошибки при восстановлении от частично прочитанного файла
+# который в данный момент ещё пишется в архив, будем создавать файл в архиве атомарно
+# через move
+cat > "$dst_dir"/"$fname".tmp
+touch --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore errors
+mv "$dst_dir"/"$fname".tmp "$dst_dir"/"$fname"
+
+exit 0

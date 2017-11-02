@@ -1,0 +1,47 @@
+#!/bin/bash
+
+set -e
+pmax=4
+remote_cmd=/usr/local/bin/archive_remote_cmd
+ssh_options="-o Compression=no -c arcfour"
+ssh_master_socket='/tmp/ssh_%h_%p_%r'
+ssh_master_options='-o ControlMaster=auto -o ControlPersist=yes'
+use_ssh_persist=
+
+if [ -f /etc/default/archive_cmd ]; then
+    . /etc/default/archive_cmd
+fi
+
+if [ -n "$use_ssh_persist" ]; then
+    ssh_options="$ssh_options -S $ssh_master_socket $ssh_master_options"
+fi
+
+dst_host="$1"
+dst_dir="$2"
+src_file="$3"
+fname="$4"
+
+if [ -z "$dst_host" -o -z "$dst_dir" -o -z "$src_file" -o -z "$fname" ]; then
+    echo -e "usage: archive_cmd DST-HOSTNAME DST-DIR SRC-WAL-FILENAME-WITH-PATH SRC-WAL-FILENAME\n" \
+	"\n" \
+	"DST-HOSTNAME               - for scp\n" \
+	"DST-DIR                    - archive directory for WALs\n" \
+	"SRC-WAL-FILENAME-WITH-PATH - %p (file name with path)\n" \
+	"SRC-WAL-FILENAME           - %f (file name)\n"
+    exit 1
+fi
+
+set -o pipefail
+
+ftime=$(stat -c %y "$src_file")
+# проверить и архивировать только WAL, backup label пропускать без архивации
+if [[ "$fname" == ???????????????????????? ]]; then
+    pbzip2 -p"$pmax" < "$src_file"
+else
+    cat "$src_file"
+fi \
+    | ssh $ssh_options "$dst_host" "$remote_cmd" "$dst_dir" "$fname" "'$ftime'"
+
+/usr/local/bin/vmtouch -q -e "$src_file"
+
+exit 0
