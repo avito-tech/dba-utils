@@ -1,0 +1,103 @@
+#!/bin/bash
+
+dbname_m1=
+dbhost_m1=
+dbport=
+dbuser=
+
+if [ "$1" = "config" ]; then
+    cat <<- EOF
+	graph_title vacuum queue size
+	graph_args --base 1000
+	graph_vlabel Count
+	graph_category PostgreSQL
+	graph_info vacuum queue size
+
+	queue_size.label queue_size
+	queue_size.info vacuum queue length
+	queue_size.min 0
+	queue_size.warning 100
+
+	vacuum.label vacuum
+	vacuum.info current VACUUM running
+	vacuum.min 0
+
+	analyze.label analyze
+	analyze.info current ANALYZE running
+	analyze.min 0
+
+	vacuum_analyze.label vacuum_analyze
+	vacuum_analyze.info current VACUUM ANALYZE running
+	vacuum_analyze.min 0
+
+	workers.label workers
+	workers.info current workers running (analyze + vacuum + vacuum_analyze)
+	workers.min 0
+
+	workers_max.label workers_max
+	workers_max.info max vacuum workers
+	workers_max.min 0
+EOF
+else
+    psql -X -At -h "$dbhost_m1" -p "$dbport" -U "$dbuser" -d "$dbname_m1" --field-separator ' ' -f- <<EOF |
+	 WITH table_opts AS (
+			SELECT
+			  pg_class.oid, relname, nspname, array_to_string(reloptions, '') AS relopts
+			FROM
+			   pg_class INNER JOIN pg_namespace ns ON relnamespace = ns.oid
+		  ), vacuum_settings AS (
+			SELECT
+			  oid, relname, nspname,
+			  CASE
+				WHEN relopts LIKE '%autovacuum_vacuum_threshold%'
+				  THEN regexp_replace(relopts, '.*autovacuum_vacuum_threshold=([0-9.]+).*', E'\\\\\\1')::integer
+				  ELSE current_setting('autovacuum_vacuum_threshold')::integer
+				END AS autovacuum_vacuum_threshold,
+			  CASE
+				WHEN relopts LIKE '%autovacuum_vacuum_scale_factor%'
+				  THEN regexp_replace(relopts, '.*autovacuum_vacuum_scale_factor=([0-9.]+).*', E'\\\\\\1')::real
+				  ELSE current_setting('autovacuum_vacuum_scale_factor')::real
+				END AS autovacuum_vacuum_scale_factor
+			FROM
+			  table_opts
+		  )
+		  SELECT
+			'queue_size', count(*)
+		  FROM
+			pg_stat_user_tables psut INNER JOIN pg_class ON psut.relid = pg_class.oid
+			  INNER JOIN vacuum_settings ON pg_class.oid = vacuum_settings.oid
+		  where autovacuum_vacuum_threshold + (autovacuum_vacuum_scale_factor::numeric * pg_class.reltuples) < psut.n_dead_tup
+         ;
+         with snapshot as ( select * from pg_stat_activity )
+           select 'vacuum', count(*)
+           from snapshot
+           where state = 'active'
+                 and query like 'autovacuum:% VACUUM %'
+                 and query not like 'autovacuum:% ANALYZE %'
+         union all
+           select 'analyze', count(*)
+           from snapshot
+           where state = 'active'
+                 and query like 'autovacuum:% ANALYZE %'
+                 and query not like 'autovacuum:% VACUUM %'
+         union all
+           select 'vacuum_analyze', count(*)
+           from snapshot
+           where state = 'active'
+                 and query ~ 'autovacuum: ((VACUUM ANALYZE)|(ANALYZE VACUUM)) .*'
+         union all
+           select 'workers', count(*)
+           from snapshot
+           where state = 'active'
+                 and query like 'autovacuum: %'
+         ;
+         select 'workers_max', current_setting('autovacuum_max_workers')
+         ;
+EOF
+    while read -a SVRDATA; do
+        name=${SVRDATA[0]}
+        val=${SVRDATA[1]}
+        echo "${name}.value" "$val"
+    done
+
+fi
