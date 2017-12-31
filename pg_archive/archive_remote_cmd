@@ -3,34 +3,96 @@
 set -e
 
 dst_dir="$1"
-fname="$2"
+fname_org="$2"
 ftime="$3"
+remote_compress="$4"
+pmax="$5"
+send_status="$6"
 log_dir=$(dirname "$dst_dir")
+send_dir="$log_dir"/send_status
+fname=$fname_org
+tmp_dir='/lib/init/rw/pg_recv_sb'
 
 if [ -z "$dst_dir" -o -z "$fname" ]; then
-    echo -e "usage: archive_remote_cmd DST-DIR DST-WAL-FILENAME SRC-FILE-TIMESTAMP\n" \
+    echo -e "usage: archive_remote_cmd DST-DIR DST-WAL-FILENAME SRC-FILE-TIMESTAMP REMOTE-COMPRESS PMAX SEND-STATUS\n" \
 	"\n" \
 	"DST-DIR                    - archive directory for WALs\n" \
 	"DST-WAL-FILENAME           - %f (file name)\n" \
 	"SRC-FILE-TIMESTAMP         - date and time of src WAL file in 'touch --date' format\n"
+	"REMOTE-COMPRESS            - received WAL is not compressed, compress it here\n"
+	"PMAX                       - if REMOTE-COMPRESS - use PMAX compress threads\n"
+	"SEND-STATUS                - create .new file for recieved WAL at DST-DIR/../send_status dir\n"
     exit 1
 fi
 
-if [ -f "$dst_dir"/"$fname" ]; then
-    echo "ERROR: $dst_dir/$fname already exist"
+# не перезаписываем ранее сохраненные файлы с неверным md5
+if [ -f "$tmp_dir"/"$fname_org".bad_md5 ]; then
+    echo "ERROR: $dst_dir/$fname_org already exist with different md5"
     exit 1
 fi
+
+# если такой WAL уже есть в архиве, попробовать сравнить его md5
+# это нужно при promote, так как postgres из-за недоработки
+# пытается со standby после его promote повторно отправить
+# в архив WALы, которые уже там есть с предыдущего мастера
+if [ -f "$dst_dir"/"$fname_org" ]; then
+    cat > "$tmp_dir"/"$fname_org".dup
+    md5_dup=`md5sum "$tmp_dir"/"$fname_org".dup | awk '{print $1}'`
+    if [[ $fname == ???????????????????????? && $remote_compress ]]; then
+        # возьмем оригинал из архива и распакуем для проверки md5
+        pbzip2 -d -p"$pmax" < "$dst_dir"/"$fname_org" > "$tmp_dir"/"$fname_org".org
+        md5_orig=`md5sum "$tmp_dir"/"$fname_org".org | awk '{print $1}'`
+        rm "$tmp_dir"/"$fname_org".org
+    else
+        md5_orig=`md5sum "$dst_dir"/"$fname_org" | awk '{print $1}'`
+    fi
+    if [[ $md5_orig != $md5_dup ]]; then
+        echo "ERROR: $dst_dir/$fname_org already exist with different md5"
+        # пожатый дубликат с другим md5 оставляем для анализа
+        mv "$tmp_dir"/"$fname_org".dup "$tmp_dir"/"$fname_org".bad_md5
+        touch --no-create --date "$ftime" "$tmp_dir"/"$fname_org".bad_md5 || true # ignore errors
+        exit 1
+    else
+        # если md5 совпадает, то выходим без ошибки
+        echo "WARN: $dst_dir/$fname_org already exist with same md5"
+        rm "$tmp_dir"/"$fname_org".dup
+        exit 0
+    fi
+fi
+
 if [ -f "$dst_dir"/"$fname".tmp ]; then
     echo "ERROR: $dst_dir/$fname.tmp already exist"
     exit 1
 fi
 
-echo "$fname" > "$log_dir"/LASTLOG
 # что бы не обрабатывать ошибки при восстановлении от частично прочитанного файла
 # который в данный момент ещё пишется в архив, будем создавать файл в архиве атомарно
 # через move
-cat > "$dst_dir"/"$fname".tmp
-touch --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore errors
+if [[ $fname == ???????????????????????? && $remote_compress ]]; then
+    cat > "$tmp_dir"/"$fname".new
+    size=$(stat -c '%s' "$tmp_dir"/"$fname".new)
+    if [[ $size -ne 16777216 ]]; then
+        mv "$tmp_dir"/"$fname".new "$tmp_dir"/"$fname".bad
+        echo "ERROR: $tmp_dir/$fname.bad wrong size: $size"
+        exit 1
+    fi
+    pbzip2 -1 -p"$pmax" < "$tmp_dir"/"$fname".new > "$dst_dir"/"$fname".tmp
+    rm "$tmp_dir"/"$fname".new
+else
+    cat > "$dst_dir"/"$fname".tmp
+fi
+
+touch --no-create --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore errors
 mv "$dst_dir"/"$fname".tmp "$dst_dir"/"$fname"
+
+# fsync файла и директории, в случае если установлен пакет 'coreutils-sync'
+if [ -f "/usr/local/bin/sync" ]; then
+    /usr/local/bin/sync "$dst_dir"/"$fname"
+    /usr/local/bin/sync "$dst_dir"
+fi
+
+if [[ $send_status ]]; then
+    echo -n > "$send_dir"/"$fname_org".new
+fi
 
 exit 0
