@@ -1,0 +1,95 @@
+#!/bin/bash
+
+# wal-sync
+# синхронизирует wal'ы между двумя архив-серверами
+
+WALS_DIR=$1
+REMOTE_ARCHIVE=$2
+LOCK_FILE_NAME=sync-archives.lock
+LOG_FILE="/var/tmp/wal-sync_${PGHOST}.log"
+RSYNC_LOG_OUT="/var/tmp/wal-sync_OUT_${PGHOST}" # rsync с этого сервера на удаленный
+RSYNC_LOG_IN="/var/tmp/wal-sync_IN_${PGHOST}"   # rsync на этот сервер с удаленного
+
+hostname=$(hostname)
+
+CWD=$(pwd) # save working dir for remote commands
+
+# опции для rsync over ssh
+ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
+ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
+ssh_master_socket='/tmp/ssh_%h_%p_%r'
+ssh_master_options='-o ControlMaster=auto -o ControlPersist=yes'
+ssh_options="$ssh_options -o ControlPath=$ssh_master_socket $ssh_master_options"
+
+function usage() {
+    echo "$(basename "$0") is script for rsync wals between two archive hosts in both directions"
+    echo
+    echo "Usage:"
+    echo "  $(basename "$0") /path/to/wals/dir REMOTE-ARCHIVE-HOST"
+    echo
+}
+
+if [ -z "$WALS_DIR" -o -z "$REMOTE_ARCHIVE" ]; then
+    usage
+    exit 1;
+fi
+
+LOCK_FILE="$WALS_DIR/../$LOCK_FILE_NAME"
+
+if [ -f "$LOCK_FILE" ]; then
+    echo "lock file '$LOCK_FILE' from $(date -r "$LOCK_FILE") exists, abort"
+    exit 1
+fi
+
+date +%s > "$LOCK_FILE"
+exec 3>&1 > "$LOG_FILE" 2>&1
+trap "cat \"$LOG_FILE\" >&3; rm -f \"$LOCK_FILE\";" EXIT
+
+# always add trailing slash to WALS_DIR to avoid catastrophic errors (rsync needs)
+WALS_DIR="$WALS_DIR"/
+
+echo $(date +'%F %T') "start wal-sync: '$WALS_DIR' '$REMOTE_ARCHIVE'"
+
+echo "##############################"
+echo "OUT dry-run of rsync wals from '${hostname}' to '${REMOTE_ARCHIVE}' :"
+date > "$RSYNC_LOG_OUT"
+echo timeout 100 rsync -a -i --dry-run --ignore-existing -e \""ssh ${ssh_options}\"" --exclude '*.tmp' \""$CWD/$WALS_DIR\"" $REMOTE_ARCHIVE:\""$CWD/$WALS_DIR\""
+timeout 100 rsync -a -i --dry-run --ignore-existing -e "ssh ${ssh_options}" --exclude '*.tmp' "$CWD/$WALS_DIR" $REMOTE_ARCHIVE:"$CWD/$WALS_DIR" >> "$RSYNC_LOG_OUT"
+echo will be synced \~ $(($(grep -F '<f' "$RSYNC_LOG_OUT" | wc -l) )) WALs
+echo '---'
+head -3 "$RSYNC_LOG_OUT"
+echo . . .
+tail -2 "$RSYNC_LOG_OUT"
+echo '---'
+
+
+echo "##############################"
+echo "IN dry-run of rsync wals from '${REMOTE_ARCHIVE}' to '${hostname}' :"
+date > "$RSYNC_LOG_IN"
+echo timeout 100 rsync -a -i --dry-run --ignore-existing -e \""ssh ${ssh_options}\"" --exclude '*.tmp' $REMOTE_ARCHIVE:\""$CWD/$WALS_DIR\"" \""$CWD/$WALS_DIR\"" 
+timeout 100 rsync -a -i --dry-run --ignore-existing -e "ssh ${ssh_options}" --exclude '*.tmp' $REMOTE_ARCHIVE:"$CWD/$WALS_DIR" "$CWD/$WALS_DIR" >> "$RSYNC_LOG_IN"
+echo will be synced \~ $(($(grep -F '>f' "$RSYNC_LOG_IN" | wc -l) )) WALs
+echo '---'
+head -3 "$RSYNC_LOG_IN"
+echo . . .
+tail -2 "$RSYNC_LOG_IN"
+echo '---'
+
+echo "Perform OUTGOING wal-sync ..."
+timeout 7200 rsync -a --ignore-existing -e "ssh ${ssh_options}" --exclude '*.tmp' "$CWD/$WALS_DIR" $REMOTE_ARCHIVE:"$CWD/$WALS_DIR"
+if [ "$?" -ne "0" ]; then
+    echo "error from OUTGOING wal-sync, abort"
+    exit 1
+fi
+
+echo "Perform INCOMING wal-sync ..."
+timeout 7200 rsync -a --ignore-existing -e "ssh ${ssh_options}" --exclude '*.tmp' $REMOTE_ARCHIVE:"$CWD/$WALS_DIR" "$CWD/$WALS_DIR"
+if [ "$?" -ne "0" ]; then
+    echo "error from INCOMING wal-sync, abort"
+    exit 1
+fi
+
+echo $(date +'%F %T') "done wal-sync: for '$WALS_DIR', host '$REMOTE_ARCHIVE'"
+
+exit 0
+

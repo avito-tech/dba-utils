@@ -1,0 +1,212 @@
+#!/bin/bash
+# base-backup.sh script takes backup task from queue in database
+# and performs backup, rotate old, clean unneded wals and rsync wals
+# between two archivers
+
+set -e
+
+# database with backup queue
+BACKUP_DB_HOST="bachup_host"
+BACKUP_DB_NAME="backup_db"
+BACKUP_DB_PORT=5432
+BACKUP_DB_USER="postgres"
+
+CMD_TIMEOUT="600"       # аргумент для утилиты timeout (psql)
+MY_HOSTNAME=$(hostname) # используется для взятия бэкапа (имя архивера)
+LOCK_FILE="/var/tmp/base-backup.lock"
+BACKUPS_DIR=$1
+KEEP_BACKUPS=$2
+REMOTE_ARCHIVE=$3
+AVITOOLS="/usr/local/bin/"
+BACKUP_PREFIX=data.master
+WALS_DIR=logs.complete
+BAREOS_DIR=bareos.dump
+SUCCESS_FILE_NAME=SUCCESS
+LANG=C
+USE_TAR=1
+TRY_COUNT=3
+
+function say() {
+    echo $(date +'%F %T') "$@"
+}
+
+# flock whole script
+{
+    flock -n 9 || exit 1
+    { echo -n "$$ "; date +'%F %T'; } > "$LOCK_FILE"
+
+    # get backup from queue and mark backup as started
+    backup_settings=$(timeout ${CMD_TIMEOUT} psql -1 -v ON_ERROR_STOP=1 -v MY_HOSTNAME="$MY_HOSTNAME" \
+                      -h ${BACKUP_DB_HOST} -d ${BACKUP_DB_NAME} -p ${BACKUP_DB_PORT} -U ${BACKUP_DB_USER} \
+                      -Atq -f - <<'EOF'
+    \pset null 'NULL'
+    select o_backip_id, o_pghost, o_pgport, o_remote_archiver,
+           o_keep_backups_cnt, o_backups_dir, o_bareos_on from backups.get_next(:'MY_HOSTNAME');
+EOF
+    )
+    if [ -z "$backup_settings" ]; then
+        # no tasks found, exit
+        exit 0
+    fi
+
+    # parse backup settings and validate
+    SAVE_IFS="$IFS"
+    IFS='|'
+    read -r backup_id PGHOST PGPORT REMOTE_ARCHIVE KEEP_BACKUPS BACKUPS_DIR BAREOS_ON <<< "${backup_settings}"
+    IFS="$SAVE_IFS"
+    for i in "$backup_id" "$PGHOST" "$PGPORT" "$REMOTE_ARCHIVE" "$KEEP_BACKUPS" "$BACKUPS_DIR" "$BAREOS_ON"; do
+        if [ "$i" = "NULL" -o -z "$i" ]; then
+            say "ERROR: bad data returned from backups.get_next():"
+            say "null or emtpy cell at tuple: '${backup_settings}'"
+            exit 1
+        fi
+    done
+
+    export PGHOST=$PGHOST PGPORT=$PGPORT
+    PGVER=$(timeout ${CMD_TIMEOUT} psql -XAt -c "select split_part(setting, '.', 1) || '.' || \
+            split_part(setting, '.', 2) from pg_settings where name = 'server_version'")
+
+    export PGVER=$PGVER
+    export PGSSLMODE=disable
+
+    PGTOOLS=/usr/lib/postgresql/$PGVER/bin
+    LOG_FILE="/var/tmp/base-backup_${PGHOST}.log"
+
+    say "Chosen backup: '${PGHOST}', backup_id: '${backup_id}'"
+    say "$backup_settings"
+
+    if [ -z "$PGHOST" ]; then
+        say "\$PGHOST environment variable is not set, abort"
+        exit 1
+    fi
+    if [ "$KEEP_BACKUPS" -le "0" ]; then
+        say "\$KEEP_BACKUPS must be >= 0"
+        exit 1
+    fi
+
+    SUCCESS_FILE="$BACKUPS_DIR/$SUCCESS_FILE_NAME"
+
+    exec 3>&1 > "$LOG_FILE" 2>&1
+    trap "cat \"$LOG_FILE\" >&3;" EXIT
+
+    say "start base-backup: '$BACKUPS_DIR' '$KEEP_BACKUPS'"
+
+    cd "$BACKUPS_DIR"
+    say "current dir: '$(pwd)'"
+
+    backups=$(find -maxdepth 1 -name "$BACKUP_PREFIX.*" -type d)
+    backups_cnt=0
+
+    if [ -n "$backups" ]; then
+        backups_cnt=$(echo "$backups" | wc -l)
+
+        # sanity check, all backup dirs must be exists
+        for ((i = 0; i < $backups_cnt; i++)); do
+    	dir="$BACKUP_PREFIX.$i";
+    	if [ ! -d "$dir" ]; then
+    	    say "something wrong, backup dir '$dir' not found, abort"
+    	    exit 1
+    	fi
+        done
+    fi
+
+    new_name="$BACKUP_PREFIX.$(($backups_cnt))" # suffix from 0
+    say "new backup: '$new_name'"
+
+    USE_TAR=${USE_TAR:+-Ft}
+
+    say $PGTOOLS/pg_basebackup $USE_TAR -D "'$new_name'" -v
+    $PGTOOLS/pg_basebackup $USE_TAR -D "$new_name" -v
+    if [ -n "$USE_TAR" ]; then
+        say tar format: untar backup_label for wal-cleanup and global/pg_control for "backup-restore -w"
+        tar -C "$new_name" -xf "$new_name"/base.tar backup_label
+        tar -C "$new_name" -xf "$new_name"/base.tar global/pg_control
+    fi
+    say "pg_basebackup is completed"
+
+    # new backup arrived!
+    backups_cnt=$((backups_cnt + 1))
+
+    last_remove=$(($backups_cnt - 1 - $KEEP_BACKUPS)) # for suffix from 0 and do not count current
+    if (( KEEP_BACKUPS < backups_cnt )); then # need rotate
+        say "rotate backups: $backups_cnt -> $KEEP_BACKUPS"
+        for ((i = 0; i <= $last_remove; i++)); do
+            dir="$BACKUP_PREFIX.$i"
+            say "remove old: '$dir'"
+            # NFS client can resend command (if network connection was lost or answer timeout, for example),
+            # Linux implementation cannot handle it corectly and rm can return "No such file or directory"
+            # error, try protect from it
+            tryed=
+            for ((j = 1; j <= $TRY_COUNT; j++)); do
+                if [ -d "$dir" ]; then
+                    tryed=1
+                    if rm -r "$dir"; then
+                        break
+                    else
+                        say "rm error, try again: $j"
+                    fi
+                else
+                    break
+                fi
+            done
+            if [ -z "$tryed" ] || [ "$j" -gt "$TRY_COUNT" ]; then
+                say "cannot remove old dir, abort"
+                exit 1
+            fi
+        done
+        for ((i = $last_remove + 1, j = 0; i < $backups_cnt; i++, j++)); do
+    	say "move: '$BACKUP_PREFIX.$i' '$BACKUP_PREFIX.$j'"
+            # TODO: protect from NFS double mv too?
+    	mv "$BACKUP_PREFIX.$i" "$BACKUP_PREFIX.$j"
+        done
+    else
+        say "skip rotation: $backups_cnt <= $KEEP_BACKUPS, need another $(($KEEP_BACKUPS - $backups_cnt)) backups for start rotation"
+    fi
+
+    # now the oldes backup is with suffix .0, so cleanup WALs at it at both archive servers
+    say $AVITOOLS/wal-cleanup_2 "'$BACKUP_PREFIX.0'" "'$WALS_DIR'" "'$REMOTE_ARCHIVE'"
+    $AVITOOLS/wal-cleanup_2 "$BACKUP_PREFIX.0" "$WALS_DIR" "$REMOTE_ARCHIVE"
+    say "wal-cleanup is completed"
+
+    # now rsync missing wals
+    say $AVITOOLS/wal-sync "'$WALS_DIR'" "'$REMOTE_ARCHIVE'"
+    $AVITOOLS/wal-sync "$WALS_DIR" "$REMOTE_ARCHIVE"
+
+    # create hardlink for bareos external backup system (bareos MUST remove this directory after its backup)
+    if [ "$MY_HOSTNAME" = "$BAREOS_ON" ]; then
+        if [ -d "$BAREOS_DIR" ]; then
+            say "bareos: directory exists, skip hardlinking"
+        else
+            bareos_tmp=$(mktemp -p "." -d ${BAREOS_DIR}-XXXX) || true # errors here is not backup fail
+            if [ ! -d "$bareos_tmp" ]; then
+                say "bareos: fail to create temp directory"
+            else
+                last=$(( $(find -maxdepth 1 -name "$BACKUP_PREFIX.*" -type d | wc -l) - 1))
+                cp --link --recursive "$BACKUP_PREFIX.$last/." "$bareos_tmp" && mv "$bareos_tmp" "$BAREOS_DIR"
+            fi
+            say "bareos: hardlinking done"
+        fi
+    else
+        if [ -d "$BAREOS_DIR" ]; then
+            # remove stale bareos dir if we moved bareos backup to another archiver
+            say "bareos: removing stale backup dir '$BAREOS_DIR' from '`pwd`'"
+            rm -rf "$BAREOS_DIR" && say "bareos: removing stale backup dir is done"
+        fi
+    fi
+
+    # mark backup as stopped in database
+    say "Mark backup '${backup_id}' as done in backups database..."
+    backup_done=$(timeout ${CMD_TIMEOUT} psql -1 -v ON_ERROR_STOP=1 -v BACKUP_ID="$backup_id" -Atq \
+                  -h ${BACKUP_DB_HOST} -d ${BACKUP_DB_NAME} -p ${BACKUP_DB_PORT} -U ${BACKUP_DB_USER} \
+                  -f - <<'EOF'
+    select backups.stop(:BACKUP_ID);
+EOF
+    )
+    say "OK"
+    say "done base-backup: '$BACKUPS_DIR' '$KEEP_BACKUPS'"
+    say > "$SUCCESS_FILE"
+
+} 9>> "$LOCK_FILE"
+
+exit 0
+
