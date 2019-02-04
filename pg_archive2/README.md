@@ -62,3 +62,5 @@ archive_command = '/usr/local/bin/archive_cmd_2 \'hostname_archive_1 hostname_ar
 retry_count="6"     # see below
 cooldown_time="600" # do not try to send file to $dst_host1 for a '$cooldown_time' seconds after '$retry_count' attemps
 ```
+
+Для /etc/postgresql-common/compress.mime.mgc используется compress.mime в котором оставлены сигнатуры только утилит сжатия, что бы избежать ложных срабатываний (на другом типе файла).
