@@ -1,0 +1,154 @@
+#!/bin/bash
+
+# archive_remote_cmd для запуска на archive серверах
+# Принимает wal'ы и сопутствующие файлы на хост, на котором вызван и на SYNC-HOST (если указан).
+# На SYNC-HOST вызывает сам себя, без REMOTE-COMPRESS, так как wal уже сжаты. 
+
+set -e
+set -o pipefail
+
+error_handler() {
+    scriptname=$(basename $0)
+    hostname=$(hostname)
+    echo "^^^ ERROR at [host: '${hostname}', file: '${scriptname}', line: '${BASH_LINENO[0]}']"
+}
+trap error_handler ERR
+
+remote_cmd=/usr/local/bin/archive_remote_cmd_2 # itslef
+
+dst_dir="$1"
+fname_org="$2"
+ftime="$3"
+remote_compress="$4"
+pmax="$5"
+cluster_name="$6"
+sync_host="$7"        # second wal archive server hostname
+fname=$fname_org
+tmp_dir="/lib/init/rw/pg_recv_sb/$cluster_name" # tmpfs for wals
+
+# опции для отправки файла на следующий archive host
+cmd_timeout="6"   # аргумент для утилиты timeout (ssh и принимающий cat)
+ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
+ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
+ssh_master_socket='/tmp/ssh_%h_%p_%r'
+ssh_master_options='-o ControlMaster=auto -o ControlPersist=yes'
+ssh_options="$ssh_options -o ControlPath=$ssh_master_socket $ssh_master_options"
+cooldown_time="600" # не пытаться отправлять $cooldown_time секунд файлы на $sync_host после ошибки
+
+if [ -z "$dst_dir" -o -z "$fname" -o -z "$cluster_name" ]; then
+    echo -e "usage: archive_remote_cmd DST-DIR DST-WAL-FILENAME SRC-FILE-TIMESTAMP REMOTE-COMPRESS PMAX CLUSTER-NAME [SYNC-HOST]\n" \
+        "\n" \
+        "DST-DIR                    - archive directory for WALs\n" \
+        "DST-WAL-FILENAME           - %f (file name)\n" \
+        "SRC-FILE-TIMESTAMP         - date and time of src WAL file in 'touch --date' format\n" \
+        "REMOTE-COMPRESS            - received WAL is not compressed, compress it here\n" \
+        "PMAX                       - if REMOTE-COMPRESS - use PMAX compress threads\n" \
+        "CLUSTER-NAME               - unique cluster name\n" \
+        "[SYNC-HOST]                - host to mirror WAL (upload via ssh)\n"
+    exit 1
+fi
+
+if [ -f /etc/default/archive_remote_cmd ]; then
+    . /etc/default/archive_remote_cmd
+fi
+
+if ! [ -d "$tmp_dir" ]; then
+    mkdir -p "$tmp_dir"
+fi
+
+# не перезаписываем ранее сохраненные файлы с неверным md5
+if [ -f "$tmp_dir"/"$fname_org".bad_md5 ]; then
+    echo "ERROR: $dst_dir/$fname_org already exist with different md5"
+    exit 1
+fi
+
+# если такой WAL уже есть в архиве, попробовать сравнить его md5
+# это нужно при promote, так как postgres из-за недоработки
+# пытается со standby после его promote повторно отправить
+# в архив WALы, которые уже там есть с предыдущего мастера
+if [ -f "$dst_dir"/"$fname_org" ] && [ "$fname_org" != "LASTLOG" ]; then
+    timeout ${cmd_timeout} cat > "$tmp_dir"/"$fname_org".dup
+    md5_dup=`md5sum "$tmp_dir"/"$fname_org".dup | awk '{print $1}'`
+    if [[ $fname == ???????????????????????? && $remote_compress ]]; then
+        # возьмем оригинал из архива и распакуем для проверки md5
+        pbzip2 -d -p"$pmax" < "$dst_dir"/"$fname_org" > "$tmp_dir"/"$fname_org".org
+        md5_orig=`md5sum "$tmp_dir"/"$fname_org".org | awk '{print $1}'`
+        rm "$tmp_dir"/"$fname_org".org
+    else
+        md5_orig=`md5sum "$dst_dir"/"$fname_org" | awk '{print $1}'`
+    fi
+    if [[ $md5_orig != $md5_dup ]]; then
+        echo "ERROR: $dst_dir/$fname_org already exist with different md5"
+        # пожатый дубликат с другим md5 оставляем для анализа
+        mv "$tmp_dir"/"$fname_org".dup "$tmp_dir"/"$fname_org".bad_md5
+        touch --no-create --date "$ftime" "$tmp_dir"/"$fname_org".bad_md5 || true # ignore errors
+        exit 1
+    else
+        # если md5 совпадает, то выходим без ошибки
+        echo "WARN: $dst_dir/$fname_org already exist with same md5"
+        rm "$tmp_dir"/"$fname_org".dup
+        exit 0
+    fi
+fi
+
+if [ -f "$dst_dir"/"$fname".tmp ]; then
+    echo "ERROR: $dst_dir/$fname.tmp already exist"
+    exit 1
+fi
+
+# что бы не обрабатывать ошибки при восстановлении от частично прочитанного файла
+# который в данный момент ещё пишется в архив, будем создавать файл в архиве атомарно
+# через move
+if [[ $fname == ???????????????????????? && $remote_compress ]]; then
+    timeout ${cmd_timeout} cat > "$tmp_dir"/"$fname".new
+    size=$(stat -c '%s' "$tmp_dir"/"$fname".new)
+    if [[ $size -ne 16777216 ]]; then
+        mv "$tmp_dir"/"$fname".new "$tmp_dir"/"$fname".bad
+        echo "ERROR: $tmp_dir/$fname.bad wrong size: $size"
+        exit 1
+    fi
+    pbzip2 -1 -p"$pmax" < "$tmp_dir"/"$fname".new > "$dst_dir"/"$fname".tmp
+    rm "$tmp_dir"/"$fname".new
+else
+    timeout ${cmd_timeout} cat > "$dst_dir"/"$fname".tmp
+fi
+
+touch --no-create --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore errors
+
+# наконец, кладем файл в директорию назначения на текущем хосте
+mv "$dst_dir"/"$fname".tmp "$dst_dir"/"$fname"
+
+# fsync файла и директории, в случае если установлен пакет 'coreutils-sync'
+if [ -f "/usr/local/bin/sync" ]; then
+    /usr/local/bin/sync "$dst_dir"/"$fname"
+    /usr/local/bin/sync "$dst_dir"
+fi
+
+# проверим настало ли время пытаться отправить файл на зеркалирующий архив
+# (прошло ли $cooldown_time секунд с момента последней ошибки отправки файла)
+if [ -f "${tmp_dir}"/"sync_wal_error_flag" ]; then
+    now_time=$(date +%s)
+    last_err_time=$(stat -c%Y "${tmp_dir}"/"sync_wal_error_flag")
+
+    # если с момента последней ошибки не прошло $cooldown_time секунд,
+    # то не пытаемся "зеркалировать" файл на второй архив-сервер
+    if [[ $(( $now_time - $last_err_time)) -le $cooldown_time ]]; then
+        sync_host=
+    fi
+fi
+# пытаемся отправить файл на второй архив-сервер
+if ! [ -z "$sync_host" ]; then
+    set +e
+    exit_code=0
+    timeout ${cmd_timeout} cat "$dst_dir"/"$fname" | \
+        timeout ${cmd_timeout} ssh $ssh_options "$sync_host" "$remote_cmd" "$dst_dir" "$fname" "'$ftime'" "''" "$pmax" "$cluster_name"
+    exit_code=$?
+    set -e
+    if [[ $exit_code -ne 0 ]] ; then
+        echo "ERROR: can't sync file '$fname' to host '$sync_host'"
+        touch "${tmp_dir}"/"sync_wal_error_flag"
+    fi
+fi
+
+exit 0
+

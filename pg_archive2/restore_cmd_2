@@ -1,0 +1,201 @@
+#!/bin/bash
+
+# в цикле пытается получить указанный wal/файл из src_hosts
+set -e
+
+error_handler() {
+    scriptname=$(basename $0)
+    hostname=$(hostname)
+    echo "^^^ ERROR at [host: '${hostname}', file: '${scriptname}', line: '${BASH_LINENO[0]}']"
+}
+trap error_handler ERR
+
+pmax=4
+local_dir=/var/local/WALs  # для ручного подкладывания wal
+only_local=                # use WALs only from local_dir, do not read it from NFS
+
+src_hosts="$1" # ssh hosts
+buffer_dir=/var/lib/postgresql/wals_buffer      # сначала загружаем файл по ssh сюда, не tmpfs
+
+tmp_dir='/lib/init/rw/pg_recv_sb'               # файлы с счетчиком ошибок, создается puppet, tmpfs
+
+cmd_timeout="6"   # аргумент для утилиты timeout (ssh запускаем через нее)
+ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
+ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
+ssh_master_socket='/tmp/ssh_%h_%p_%r'
+ssh_master_options='-o ControlMaster=auto -o ControlPersist=yes'
+use_ssh_persist=yes
+
+src_dir="$2"
+fname="$3"
+dst_file="$4"    # всегда называется 'pg_xlog/RECOVERYXLOG'
+delay_time="$5"  # wal apply delay
+
+retry_count="6"     # see below
+cooldown_time="600" # do not try to catch file from host for a '$cooldown_time' seconds after $retry_count attemps
+
+if [ -f /etc/default/restore_cmd ]; then
+    . /etc/default/restore_cmd
+fi
+
+if [ -n "$use_ssh_persist" ]; then
+    ssh_options="$ssh_options -o ControlPath=$ssh_master_socket $ssh_master_options"
+fi
+
+if [ -z "$src_hosts" -o -z "$src_dir" -o -z "$fname" -o -z "$dst_file" ]; then
+    echo -e "usage: restore_cmd 'SRC-HOSTNAMES' SRC-DIR SRC-WAL-FILENAME DST-WAL-FILENAME-WITH-PATH [DELAY-SECONDS]\n" \
+	"\n" \
+	"SRC-HOSTNAMES              - two archive host names in single quotes\n" \
+	"SRC-DIR                    - archive directory with WALs\n" \
+	"SRC-WAL-FILENAME           - %f (file name)\n" \
+	"DST-WAL-FILENAME-WITH-PATH - %p (file name with path)\n" \
+	"DELAY-SECONDS              - copy WAL file only if it older than this seconds\n"
+    exit 1
+fi
+
+decompress() {
+    local dst_file=$1
+    mime=$(file -m /etc/postgresql-common/compress.mime.mgc -b --mime-type "$dst_file")
+    if [ "$mime" = "application/x-bzip2" ]; then
+        pbzip2 -p"$pmax" -d < "$dst_file" > "$dst_file".bz2-tmp
+        mv "$dst_file".bz2-tmp "$dst_file"
+    elif [ "$mime" = "application/x-gzip" ]; then
+        gunzip < "$dst_file" > "$dst_file".gz-tmp
+        mv "$dst_file".gz-tmp "$dst_file"
+    fi
+}
+
+# решает применять текущий wal или нет из директории-буфера
+apply_wal() {
+    local src_dir=$1
+    local fname=$2
+    local dst_file=$3
+
+    if [ "$delay_time" ] && [ "$delay_time" -gt 0 ]; then
+        ftime="$(stat -c %Y "$src_dir"/"$fname")"
+        apply_time="$(date --date="now - $delay_time seconds" +%s)"
+        if [ "$ftime" -gt "$apply_time" ]; then
+            # file is too new, skip it, replay it only after $delay_time seconds
+            # show message only sometimes
+            if [ $(( (ftime - apply_time) % (10 * 60) )) -lt 3 ]; then
+                echo "file '$fname' is too new ($((ftime - apply_time))s), skip it"
+            fi
+            exit 1
+        fi
+    fi
+
+    mv "$src_dir"/"$fname" "$dst_file"
+    decompress "$dst_file"
+}
+
+if [ -d "$local_dir" ] && [ -f "$local_dir"/"$fname" ]; then
+    src_dir="$local_dir"
+fi
+
+if ! [ -d "$buffer_dir" ]; then
+    mkdir -p "$buffer_dir"
+fi
+
+# проверяем что файл существует и его размер не равен 0
+if [ -s "$buffer_dir"/"$fname" ]; then
+    src_dir="$buffer_dir"
+fi
+
+if [ "$only_local" ] && [ "$src_dir" != "$local_dir" ]; then
+    # src_dir set to local_dir above, if not - requested WAL file does not exist in local_dir, exit now
+    exit 1
+fi
+
+# take wal from 'special local dir' or 'ssh buffer dir'
+if [ "$src_dir" = "$local_dir" ] || [ "$src_dir" = "$buffer_dir" ]; then
+    apply_wal "$src_dir" "$fname" "$dst_file"
+    exit 0
+fi
+
+src_hosts_count=$(wc -w <<< $src_hosts)
+
+# fetch wal via ssh to buffer dir
+fetch_errors=0 # любые ошибки получения wal
+conn_errors=0  # только ошибки копирования wal по ssh
+for host in $src_hosts ; do
+    # сначала проверяем нужно ли делать попытку для данного хоста
+    if [ -f "${tmp_dir}/ssh-errors_${host}_" ]; then
+        # если не достигли $retry_count, то продолжаем пытаться читать с данного хоста
+        was_failed_cnt=$(<"${tmp_dir}/ssh-errors_${host}_")
+        if [ "$was_failed_cnt" -lt "$retry_count" ]; then
+            true
+        # при достижении $retry_count попыток ssh, перестаем пытаться прочитать wal с хоста $cooldown_time секунд
+        else
+            now_time=$(date +%s)
+            last_err_time=$(stat -c%Y "${tmp_dir}/ssh-errors_${host}_")
+            if [[ $(( $now_time - $last_err_time)) -le $cooldown_time ]]; then
+                fetch_errors=$(($fetch_errors + 1))
+                # попытаемся прочитать со следующего хоста
+                continue
+            # начинаем заново пытаться после $cooldown_time, сбросив счетчик ошибок хоста
+            else
+                rm "${tmp_dir}/ssh-errors_${host}_"
+            fi
+        fi
+    fi
+
+    # читаем файл через ssh
+    # в случае ошибки, создаст файл нулевого размера (!)
+    set +e
+    timeout ${cmd_timeout} ssh ${ssh_options} ${host} \
+        "test -f '$src_dir'/'$fname' && cat '$src_dir'/'$fname' || exit 148" \
+                      > "$buffer_dir"/"$fname".part
+    ssh_code=$?
+    set -e
+    # выходим из цикла, если удалось забрать файл
+    if [ "$ssh_code" -eq "0" ]; then
+        # при успехе, сбрасываем счетчик ошибок, удалив файл счетчика
+        [ -f "${tmp_dir}/ssh-errors_${host}_" ] && rm "${tmp_dir}/ssh-errors_${host}_"
+        mv "$buffer_dir"/"$fname".part "$buffer_dir"/"$fname"
+        break;
+    # файла еще нет на архив-сервере
+    elif [ "$ssh_code" -eq "148" ]; then
+        echo "ERROR: can't find wal '$fname' at host '$host'"
+        # сбрасываем файл-счетчик ошибок, так как связь есть/восстановлена
+        [ -f "${tmp_dir}/ssh-errors_${host}_" ] && rm "${tmp_dir}/ssh-errors_${host}_"
+        fetch_errors=$(($fetch_errors + 1))
+        # удаляем пустой временный файл (size 0)
+        test -f "$buffer_dir"/"$fname".part && rm "$buffer_dir"/"$fname".part
+    # все остальные коды выхода считаем ошибкой соединения
+    else
+        echo "ERROR: connection error, can't fetch wal '$fname' from host '$host'"
+        fetch_errors=$(($fetch_errors + 1))
+        conn_errors=$(($conn_errors + 1))
+
+        # инкрементируем файл-счетчик ошибок соединения с хостом
+        if [ -f "${tmp_dir}/ssh-errors_${host}_" ]; then
+            failed_cnt=$(<"${tmp_dir}/ssh-errors_${host}_")
+            failed_cnt=$(( failed_cnt + 1 ))
+            echo "$failed_cnt" > "${tmp_dir}/ssh-errors_${host}_"
+        else
+            echo 1 > "${tmp_dir}/ssh-errors_${host}_"
+        fi
+        # удаляем пустой временный файл (size 0)
+        test -f "$buffer_dir"/"$fname".part && rm "$buffer_dir"/"$fname".part
+    fi
+done
+
+# если не удалось подключиться к обоим хостам, то удаляем их файлы-счетчики ошибок,
+# чтобы не "уснуть" зря и надолго
+if [ "$conn_errors" -ge "$src_hosts_count" ]; then
+    for host in $src_hosts ; do
+        if [ -f "${tmp_dir}/ssh-errors_${host}_" ]; then
+            rm "${tmp_dir}/ssh-errors_${host}_"
+        fi
+    done
+fi
+
+if [ "$fetch_errors" -ge "$src_hosts_count" ]; then
+    echo "ERROR: can't fetch wal from all hosts: ${src_hosts}"
+    exit 1
+fi
+
+apply_wal "$buffer_dir" "$fname" "$dst_file"
+
+exit 0
+
