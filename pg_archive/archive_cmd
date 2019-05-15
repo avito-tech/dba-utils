@@ -10,7 +10,7 @@ use_ssh_persist=
 remote_compress=
 send_status=
 pwals=5
-ready_wals_for_parallel=10   # ready wals должен быть, как минимум, в два раза больше, чем pwals ?
+ready_wals_for_parallel=10   # ready WALs should be at least twice greater than pwals
 
 unset LANG LANGUAGE LC_ALL LC_CTYPE LC_COLLATE LC_MESSAGES LC_TIME LC_NUMERIC
 export LC_ALL=C
@@ -43,7 +43,7 @@ fi
 
 set -o pipefail
 
-# проверяет является ли имя файла именем wal
+# checks if the file name is WAL file name
 is_wal() {
     local fname="$1"
     if [[ "$fname" == ???????????????????????? ]] && [[ "$fname" != *.* ]]; then
@@ -53,12 +53,12 @@ is_wal() {
     fi
 }
 
-# отправляет файл на standby по ssh
+# transfers WAL to standby using ssh
 send_wal() {
     local fname_with_path="$1"
     local file_name="$2"
     ftime=$(stat -c %y "$fname_with_path")
-    # проверить и архивировать только WAL, backup label и history пропускать без архивации
+    # compress only WAL files, skip compressing of  backup label и history  files
     if [[ "$file_name" == ???????????????????????? && -z "$remote_compress" ]]; then
         pbzip2 -1 -p"$pmax" < "$fname_with_path"
     else
@@ -68,15 +68,15 @@ send_wal() {
     /usr/local/bin/vmtouch -q -e "$fname_with_path"
 }
 
-# проверим не отправлялся ли такой файл уже в архив
+# check the  existence of WAL file in the archive
 if [[ -r ${log_dir}/LASTLOG ]]; then
     prev_archived=$(< ${log_dir}/LASTLOG)
 else
     prev_archived=""
 fi
-# файлы вида '000000010004EF04000000E1.00010DF0.backup' и '00000015.history' архивируем всегда
-# сравниваем только wal
-# если предыдущий заархивированный файл не wal - архивируем в один поток (для корректного сравнения '<')
+# files like '000000010004EF04000000E1.00010DF0.backup' and '00000015.history' are always archived
+# compare only WAL files
+# if last archived file is not WAL, then single thread archiving (for correct comparing with the help of '<')
 if is_wal "$fname" && is_wal "$prev_archived"; then
     if [[ "$fname" < "$prev_archived" ]] || [[ "$fname" = "$prev_archived" ]]; then
         echo "File '$fname' was already sent to archive. Skipping..."
@@ -84,31 +84,31 @@ if is_wal "$fname" && is_wal "$prev_archived"; then
     fi
 fi
 
-# нужно ли выполнить параллельное архивирование?
+# is multi-thread archiving needed?
 ready_count=$(find ${arch_status_dir}/ -maxdepth 1 -type f -name "????????????????????????.ready" | wc -l)
 
-# архивируем в один поток если:
-# - число готовых к архивации wal меньше порога ready_wals_for_parallel
-# - файл не является wal (.backup, .history)
-# - предыдущий заархивированный файл не является wal
+# single thread archive if:
+# - ready WAL files cnt is less than threshold “ready_wals_for_parallel “
+# - file is not WAL (.backup, .history)
+# - previous archived file is not WAL file
 if [[ $ready_count -le $ready_wals_for_parallel ]] || ! is_wal "$fname" || ! is_wal "$prev_archived"; then
     send_wal "$src_file" "$fname"
     wal=$fname
 else
-    # запускаем параллельное архивирвоание
+    # run multi-threaded archiving
 
-    # возьем pwals файлов
+    # take pwals files
     ready_wals=$(find ${arch_status_dir}/ -maxdepth 1 -type f -name "????????????????????????.ready" -printf '%f\n'\
                         | sort | grep -A "$(( pwals - 1 ))" -F ${fname})
 
-    # отправим эти wal параллельно
+    # multi-threaded file transfer
     declare -A send_pids
     for wal_ready in $ready_wals ; do
         wal=${wal_ready%.ready}
         send_wal "$src_dir"/"$wal" "$wal" & send_pids[$wal]=$!
     done
 
-    # обработаем все коды выхода каждого потока
+    # for each thread check exit code
     for wal_pid in ${!send_pids[@]}; do
         exit_code=0
         wait ${send_pids[$wal_pid]} || exit_code=$?

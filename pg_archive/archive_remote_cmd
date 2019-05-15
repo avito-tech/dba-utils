@@ -25,21 +25,18 @@ if [ -z "$dst_dir" -o -z "$fname" ]; then
     exit 1
 fi
 
-# не перезаписываем ранее сохраненные файлы с неверным md5
+# don’t overwrite previously saved files with wrong md5 value
 if [ -f "$tmp_dir"/"$fname_org".bad_md5 ]; then
     echo "ERROR: $dst_dir/$fname_org already exist with different md5"
     exit 1
 fi
 
-# если такой WAL уже есть в архиве, попробовать сравнить его md5
-# это нужно при promote, так как postgres из-за недоработки
-# пытается со standby после его promote повторно отправить
-# в архив WALы, которые уже там есть с предыдущего мастера
+ # if there is the same WAL file in archchive, check md5
 if [ -f "$dst_dir"/"$fname_org" ]; then
     cat > "$tmp_dir"/"$fname_org".dup
     md5_dup=`md5sum "$tmp_dir"/"$fname_org".dup | awk '{print $1}'`
     if [[ $fname == ???????????????????????? && $remote_compress ]]; then
-        # возьмем оригинал из архива и распакуем для проверки md5
+        # uncompress file from archive to compare its md5 value
         pbzip2 -d -p"$pmax" < "$dst_dir"/"$fname_org" > "$tmp_dir"/"$fname_org".org
         md5_orig=`md5sum "$tmp_dir"/"$fname_org".org | awk '{print $1}'`
         rm "$tmp_dir"/"$fname_org".org
@@ -48,12 +45,12 @@ if [ -f "$dst_dir"/"$fname_org" ]; then
     fi
     if [[ $md5_orig != $md5_dup ]]; then
         echo "ERROR: $dst_dir/$fname_org already exist with different md5"
-        # пожатый дубликат с другим md5 оставляем для анализа
+        # save the compressed copy with another md5 value for analyze purpose
         mv "$tmp_dir"/"$fname_org".dup "$tmp_dir"/"$fname_org".bad_md5
         touch --no-create --date "$ftime" "$tmp_dir"/"$fname_org".bad_md5 || true # ignore errors
         exit 1
     else
-        # если md5 совпадает, то выходим без ошибки
+        # if md5 values do not match, then exit without error
         echo "WARN: $dst_dir/$fname_org already exist with same md5"
         rm "$tmp_dir"/"$fname_org".dup
         exit 0
@@ -65,9 +62,9 @@ if [ -f "$dst_dir"/"$fname".tmp ]; then
     exit 1
 fi
 
-# что бы не обрабатывать ошибки при восстановлении от частично прочитанного файла
-# который в данный момент ещё пишется в архив, будем создавать файл в архиве атомарно
-# через move
+# to skip errors of recovering partial file
+# which is being archived (still in progress), let’s atomary create file in archive
+# with the help of move
 if [[ $fname == ???????????????????????? && $remote_compress ]]; then
     cat > "$tmp_dir"/"$fname".new
     size=$(stat -c '%s' "$tmp_dir"/"$fname".new)
@@ -85,7 +82,7 @@ fi
 touch --no-create --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore errors
 mv "$dst_dir"/"$fname".tmp "$dst_dir"/"$fname"
 
-# fsync файла и директории, в случае если установлен пакет 'coreutils-sync'
+#If 'coreutils-sync' is installed, fsync file and folder
 if [ -f "/usr/local/bin/sync" ]; then
     /usr/local/bin/sync "$dst_dir"/"$fname"
     /usr/local/bin/sync "$dst_dir"

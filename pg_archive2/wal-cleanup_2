@@ -13,6 +13,8 @@ PG_ARCHIVECLEANUP_LOG_REMOTE="/var/tmp/wal-cleanup-pg_archivecleanup_REMOTE_${PG
 
 # опции для проверки последнего нужного wal на зеркалирующем archive хосте и удаленного cleanup
 cmd_timeout="1200"   # аргумент для утилиты timeout (ssh)
+cmd_cleanup_timeout=$((4 * 60 * 60))  # аргумент для утилиты timeout (ssh) при вызове pg_archivecleanup для непосредственно очистки
+retry_cnt=1
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
 ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
 ssh_master_socket='/tmp/ssh_%h_%p_%r'
@@ -29,108 +31,138 @@ function usage() {
     echo "usage: wal-cleanup /path/to/walshipping/src_backup /path/to/walshipping/logs REMOTE-ARCHIVE-HOST"
 }
 
+function say() {
+    echo $(date +'%F %T') "$@"
+}
+
 if [ -z "$SRC_DIR" -o -z "$WALS_DIR" -o -z "$REMOTE_ARCHIVE" ]; then
     usage
     exit 1
 fi
 
-LOCK_FILE="$WALS_DIR/../$LOCK_FILE_NAME"
+LOCK_FILE=$(readlink -f "$WALS_DIR/../$LOCK_FILE_NAME")
 
-if [ -f "$LOCK_FILE" ]; then
-    echo "lock file '$LOCK_FILE' from $(date -r "$LOCK_FILE") exists, abort"
-    exit 1
-fi
+set -e # check redirect
 
-date +%s > "$LOCK_FILE"
-exec 3>&1 > "$LOG_FILE" 2>&1
-trap "cat \"$LOG_FILE\" >&3; rm -f \"$LOCK_FILE\";" EXIT
+main () {
+    set +e # redirect checked
 
-echo $(date +'%F %T') "start wal-cleanup: '$SRC_DIR' '$WALS_DIR'"
+    flock -n 9 || { echo "lock file '$LOCK_FILE' from $(< "$LOCK_FILE") locked, abort"; exit 1; }
+    { echo -n "$$ "; date +'%F %T'; } > "$LOCK_FILE"
 
-if [ ! -r "$SRC_DIR"/backup_label ]; then
-    echo "cannot read LOCAL $SRC_DIR/backup_label, abort"
-    exit 1
-fi
+    exec 3>&1 > "$LOG_FILE" 2>&1
+    trap "cat \"$LOG_FILE\" >&3" EXIT
 
-LAST_NEEDED_WAL_LOCAL=$(grep 'START WAL LOCATION.\+(file .\+)' "$SRC_DIR"/backup_label 2> /dev/null | sed -e 's/.\+(file \(.\+\))/\1/')
-echo "LOCAL backup label: '$SRC_DIR/backup_label', last LOCAL needed wal: '$WALS_DIR/$LAST_NEEDED_WAL_LOCAL'"
+    say "start wal-cleanup: '$SRC_DIR' '$WALS_DIR'"
 
-if [ -z "$LAST_NEEDED_WAL_LOCAL" ]; then
-    echo "cannot find last needed LOCAL wal, abort"
-    exit 1
-fi
+    if [ ! -r "$SRC_DIR"/backup_label ]; then
+        echo "cannot read LOCAL $SRC_DIR/backup_label, abort"
+        exit 1
+    fi
 
-if [ ! -f "$WALS_DIR"/"$LAST_NEEDED_WAL_LOCAL" ]; then
-    echo "something wrong, last needed LOCAL wal not exists, abort"
-    exit 1
-fi
+    LAST_NEEDED_WAL_LOCAL=$(grep 'START WAL LOCATION.\+(file .\+)' "$SRC_DIR"/backup_label 2> /dev/null | sed -e 's/.\+(file \(.\+\))/\1/')
+    echo "LOCAL backup label: '$SRC_DIR/backup_label', last LOCAL needed wal: '$WALS_DIR/$LAST_NEEDED_WAL_LOCAL'"
 
-# проверим существует ли backup_label на удаленном сервере и убедимся, что это точно не ошибка ssh
-no_remote_backup_label=$(timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "test -f \"$CWD/$SRC_DIR\"/backup_label || echo 'no backup label'")
-if [ "$no_remote_backup_label" = "no backup label" ]; then
-    # если backup_label нет, LAST_NEEDED_WAL_OLDEST будем читать из локального backup_label (ниже)
-    echo "WARNING: backup_label at REMOTE host '$REMOTE_ARCHIVE' does not exist. No backups?"
-    LAST_NEEDED_WAL_REMOTE="GGGGGGGGGGGGGGGGGGGGGGGG"
-else
-    # по ssh считываем backup_label на зеркалирующем архиве
-    LAST_NEEDED_WAL_REMOTE=$(timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "grep 'START WAL LOCATION.\+(file .\+)' \"$CWD/$SRC_DIR\"/backup_label | sed -e 's/.\+(file \(.\+\))/\1/'")
-fi
+    if [ -z "$LAST_NEEDED_WAL_LOCAL" ]; then
+        echo "cannot find last needed LOCAL wal, abort"
+        exit 1
+    fi
 
-if [[ "$LAST_NEEDED_WAL_REMOTE" != ???????????????????????? ]]; then
-    echo "something wrong, can't read last needed REMOTE wal"
-    exit 1
-else
-    echo "REMOTE backup label: '$SRC_DIR/backup_label', last REMOTE needed wal: '$WALS_DIR/$LAST_NEEDED_WAL_REMOTE'"
-fi
+    if [ ! -f "$WALS_DIR"/"$LAST_NEEDED_WAL_LOCAL" ]; then
+        echo "something wrong, last needed LOCAL wal not exists, abort"
+        exit 1
+    fi
 
-# выбираем самый старый wal
-if [[ "$LAST_NEEDED_WAL_LOCAL" < "$LAST_NEEDED_WAL_REMOTE" ]]; then
-    LAST_NEEDED_WAL_OLDEST=$LAST_NEEDED_WAL_LOCAL
-else
-    LAST_NEEDED_WAL_OLDEST=$LAST_NEEDED_WAL_REMOTE
-fi
+    # check if backup_label on remote server exists and check that there is no ssh error
+    no_remote_backup_label=$(timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "test -f \"$CWD/$SRC_DIR\"/backup_label || echo 'no backup label'")
+    if [ "$no_remote_backup_label" = "no backup label" ]; then
+        # if  there is no backup_label, read LAST_NEEDED_WAL_OLDEST from local backup_label
+        echo "WARNING: backup_label at REMOTE host '$REMOTE_ARCHIVE' does not exist. No backups?"
+        LAST_NEEDED_WAL_REMOTE="GGGGGGGGGGGGGGGGGGGGGGGG"
+    else
+        # with the help of ssh read backup_label
+        LAST_NEEDED_WAL_REMOTE=$(timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "grep 'START WAL LOCATION.\+(file .\+)' \"$CWD/$SRC_DIR\"/backup_label | sed -e 's/.\+(file \(.\+\))/\1/'")
+    fi
 
-echo "oldest needed wal is: '$LAST_NEEDED_WAL_OLDEST'"
+    if [[ "$LAST_NEEDED_WAL_REMOTE" != ???????????????????????? ]]; then
+        echo "something wrong, can't read last needed REMOTE wal"
+        exit 1
+    else
+        echo "REMOTE backup label: '$SRC_DIR/backup_label', last REMOTE needed wal: '$WALS_DIR/$LAST_NEEDED_WAL_REMOTE'"
+    fi
 
-echo "##############################"
-echo "LOCAL dry-run of pg_archivecleanup"
-echo "$PGTOOLS"/pg_archivecleanup -n "$WALS_DIR" "$LAST_NEEDED_WAL_OLDEST"
-date > "$PG_ARCHIVECLEANUP_LOG_LOCAL"
-"$PGTOOLS"/pg_archivecleanup -n "$WALS_DIR" "$LAST_NEEDED_WAL_OLDEST" | sort >> "$PG_ARCHIVECLEANUP_LOG_LOCAL"
-echo will be cleaned \~ $(($(wc -l "$PG_ARCHIVECLEANUP_LOG_LOCAL" | cut -d' ' -f1) - 1)) WALs
-echo '---'
-head -3 "$PG_ARCHIVECLEANUP_LOG_LOCAL"
-echo . . .
-tail -2 "$PG_ARCHIVECLEANUP_LOG_LOCAL"
-echo '---'
+    # choose the oldest WAL
+    if [[ "$LAST_NEEDED_WAL_LOCAL" < "$LAST_NEEDED_WAL_REMOTE" ]]; then
+        LAST_NEEDED_WAL_OLDEST=$LAST_NEEDED_WAL_LOCAL
+    else
+        LAST_NEEDED_WAL_OLDEST=$LAST_NEEDED_WAL_REMOTE
+    fi
 
-echo "##############################"
-echo "REMOTE dry-run of pg_archivecleanup"
-date > "$PG_ARCHIVECLEANUP_LOG_REMOTE"
-echo timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "\"$PGTOOLS\"/pg_archivecleanup -n \"$CWD/$WALS_DIR\" \"$LAST_NEEDED_WAL_OLDEST\""
-timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "\"$PGTOOLS\"/pg_archivecleanup -n \"$CWD/$WALS_DIR\" \"$LAST_NEEDED_WAL_OLDEST\"" | sort >> "$PG_ARCHIVECLEANUP_LOG_REMOTE"
-echo will be cleaned \~ $(($(wc -l "$PG_ARCHIVECLEANUP_LOG_REMOTE" | cut -d' ' -f1) - 1)) WALs
-echo '---'
-head -3 "$PG_ARCHIVECLEANUP_LOG_REMOTE"
-echo . . .
-tail -2 "$PG_ARCHIVECLEANUP_LOG_REMOTE"
-echo '---'
+    echo "oldest needed wal is: '$LAST_NEEDED_WAL_OLDEST'"
 
-# pg_archivecleanup не возвращает код ошибки при ошибке удаления WAL, а всегда возвращает 0, поэтому результат
-# выполнения pg_archivecleanup невозможно проверить... проверяем тут только ошибки существования каталога и
-# присутствие необходимых аргументов
-echo "Perform LOCAL pg_archivecleanup ..."
-if ! "$PGTOOLS"/pg_archivecleanup "$WALS_DIR" "$LAST_NEEDED_WAL_OLDEST"; then
-    echo "error from LOCAL pg_archivecleanup, abort"
-    exit 1
-fi
-echo "Perform REMOTE pg_archivecleanup ..."
-if ! timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "\"$PGTOOLS\"/pg_archivecleanup \"$CWD/$WALS_DIR\" \"$LAST_NEEDED_WAL_OLDEST\""; then
-    echo "error from LOCAL pg_archivecleanup, abort"
-    exit 1
-fi
+    echo "##############################"
+    echo "LOCAL dry-run of pg_archivecleanup"
+    echo "$PGTOOLS"/pg_archivecleanup -n "$WALS_DIR" "$LAST_NEEDED_WAL_OLDEST"
+    date > "$PG_ARCHIVECLEANUP_LOG_LOCAL"
+    "$PGTOOLS"/pg_archivecleanup -n "$WALS_DIR" "$LAST_NEEDED_WAL_OLDEST" | sort >> "$PG_ARCHIVECLEANUP_LOG_LOCAL"
+    echo will be cleaned \~ $(($(wc -l "$PG_ARCHIVECLEANUP_LOG_LOCAL" | cut -d' ' -f1) - 1)) WALs
+    echo '---'
+    head -3 "$PG_ARCHIVECLEANUP_LOG_LOCAL"
+    echo . . .
+    tail -2 "$PG_ARCHIVECLEANUP_LOG_LOCAL"
+    echo '---'
 
-echo $(date +'%F %T') "done wal-cleanup: '$SRC_DIR' '$WALS_DIR'"
+    echo "##############################"
+    echo "REMOTE dry-run of pg_archivecleanup"
+    date > "$PG_ARCHIVECLEANUP_LOG_REMOTE"
+    echo timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "\"$PGTOOLS\"/pg_archivecleanup -n \"$CWD/$WALS_DIR\" \"$LAST_NEEDED_WAL_OLDEST\""
+    timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "\"$PGTOOLS\"/pg_archivecleanup -n \"$CWD/$WALS_DIR\" \"$LAST_NEEDED_WAL_OLDEST\"" | sort >> "$PG_ARCHIVECLEANUP_LOG_REMOTE"
+    echo will be cleaned \~ $(($(wc -l "$PG_ARCHIVECLEANUP_LOG_REMOTE" | cut -d' ' -f1) - 1)) WALs
+    echo '---'
+    head -3 "$PG_ARCHIVECLEANUP_LOG_REMOTE"
+    echo . . .
+    tail -2 "$PG_ARCHIVECLEANUP_LOG_REMOTE"
+    echo '---'
+
+    # pg_archivecleanup don't return error code when there is an error in WAL delete operation, it always return 0, that is why
+    # result of pg_archivecleanup can't be checked
+    say "Perform LOCAL pg_archivecleanup ..."
+    if ! "$PGTOOLS"/pg_archivecleanup "$WALS_DIR" "$LAST_NEEDED_WAL_OLDEST"; then
+        echo "error from LOCAL pg_archivecleanup, abort"
+        exit 1
+    fi
+    for ((i = 0; i <= retry_cnt; i++)); do
+        say "Perform REMOTE pg_archivecleanup ..."
+        if ! timeout ${cmd_cleanup_timeout} \
+             ssh $ssh_options $REMOTE_ARCHIVE \
+             flock -nE 125 "$LOCK_FILE" "'$PGTOOLS'/pg_archivecleanup '$CWD/$WALS_DIR' '$LAST_NEEDED_WAL_OLDEST'"
+        then
+            res=${PIPESTATUS[0]}
+            if (( res == 124 )); then
+                if ((i != retry_cnt)); then
+                    msg="retrying ($((i+1)) of $retry_cnt)"
+                else
+                    msg="abort"
+                fi
+                echo "REMOTE pg_archivecleanup timeout, $msg"
+                continue
+            elif (( res == 125 )); then
+                echo "REMOTE pg_archivecleanup still running, abort"
+                exit 1
+            else
+                echo "error with REMOTE pg_archivecleanup, abort"
+                exit 1
+            fi
+        else
+            break
+        fi
+    done
+
+    say "done wal-cleanup: '$SRC_DIR' '$WALS_DIR'"
+
+} 9>> "$LOCK_FILE"
+
+main
 
 exit 0
 
