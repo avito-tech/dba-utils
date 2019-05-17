@@ -135,7 +135,7 @@ fi
 
 # take wal from 'special local dir' or 'ssh buffer dir'
 if [ "$src_dir" = "$local_dir" ] || [ "$src_dir" = "$buffer_dir" ]; then
-    apply_wal "$src_dir" "$fname" "$dst_file"
+    apply_wal '' "$src_dir" "$fname" "$dst_file"
     exit 0
 fi
 

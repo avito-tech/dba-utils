@@ -1,4 +1,6 @@
-﻿create table backups.hosts (
+create schema if not exists backups;
+
+create table backups.hosts (
   id serial primary key,
   host text not null,
   port int default 5432,

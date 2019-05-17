@@ -142,6 +142,7 @@ fi
 if [ -f "${tmp_dir}"/"sync_wal_error_flag" ]; then
     now_time=$(date +%s)
     last_err_time=$(stat -c%Y "${tmp_dir}"/"sync_wal_error_flag")
+
     if [[ $(( $now_time - $last_err_time)) -le $cooldown_time ]]; then
         sync_host=
     fi
