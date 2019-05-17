@@ -28,13 +28,13 @@ fname=$fname_org
 tmp_dir="/lib/init/rw/pg_recv_sb/$cluster_name" # tmpfs for wals
 
 # options for sending WAL to second archive host
-cmd_timeout="6"   # timeout  parameter for ssh, cat
+cmd_timeout="6"   # timeout parameter for ssh, cat
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
 ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
 ssh_master_socket='/tmp/ssh_%h_%p_%r'
 ssh_master_options='-o ControlMaster=auto -o ControlPersist=yes'
 ssh_options="$ssh_options -o ControlPath=$ssh_master_socket $ssh_master_options"
-cooldown_time="600" # don’t try to send files to  $sync_host  after an error during $cooldown_time seconds
+cooldown_time="600" # don’t try to send files to $sync_host after an error during $cooldown_time seconds
 
 recv_checked() {
     local timeout=$1
@@ -102,7 +102,7 @@ if [ -f "$dst_dir"/"$fname_org" ] && [ "$fname_org" != "LASTLOG" ]; then
         touch --no-create --date "$ftime" "$tmp_dir"/"$fname_org".bad_md5 || true # ignore errors
         exit 1
     else
-        # if md5 values do not match, then exit without error
+        # if md5 values match, then exit without error
         echo "WARN: $dst_dir/$fname_org already exist with same md5"
         rm "$tmp_dir"/"$fname_org".dup
         exit 0
@@ -115,7 +115,7 @@ if [ -f "$dst_dir"/"$fname".tmp ]; then
 fi
 
 # to skip errors of recovering partial file
-# which is being archived (still in progress), let’s atomary create file in archive
+# which is being archived (still in progress), let’s atomically create file in archive
 # with the help of move
 if [[ $fname == ???????????????????????? && ! $skip_compress ]]; then
     recv_checked "${cmd_timeout}" "$tmp_dir"/"$fname".new "$fsize"
@@ -129,7 +129,7 @@ touch --no-create --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore error
 
 mv "$dst_dir"/"$fname".tmp "$dst_dir"/"$fname"
 
-#If 'coreutils-sync' is installed, fsync file and folder
+# if 'coreutils-sync' is installed, fsync file and folder
 if [ -f "/usr/local/bin/sync" ]; then
     /usr/local/bin/sync "$dst_dir"/"$fname"
     /usr/local/bin/sync "$dst_dir"

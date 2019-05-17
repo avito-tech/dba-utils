@@ -21,7 +21,7 @@ trap error_handler ERR
 
 pmax=4  # the number of compressing threads
 remote_cmd=/usr/local/bin/archive_remote_cmd_2
-local_lastlog="/var/lib/postgresql/LASTLOG" # local copy of the file with the name of  last successfully sent file
+local_lastlog="/var/lib/postgresql/LASTLOG" # local copy of the file with the name of last successfully sent file
 
 cmd_timeout="6"   # parameter with timeout (for ssh/cat/compress)
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
@@ -101,7 +101,7 @@ send_wal() {
                   "'$sync_host'" "'$fsize'"
 }
 
-# increments error counter for  $dst_host0 in file  (ignore $dst_host1)
+# increments error counter for $dst_host0 in file (ignore $dst_host1)
 increment_wal_errors_cnt() {
     local was_failed_cnt
     [ "$current_dst_host" = "$dst_host1" ] && return 0
@@ -115,14 +115,14 @@ increment_wal_errors_cnt() {
     fi
 }
 
-# sets current  $current_dst_host value to one on which to send files
-# first check if we should try to send file to $dst_host0  or directly send it to $dst_host1
+# sets current $current_dst_host value to one on which to send files
+# first check if we should try to send file to $dst_host0 or directly send it to $dst_host1
 if [ -f "${tmp_dir}/send_wal_errors_cnt_${dst_host0}_" ]; then
     was_failed_cnt=$(<"${tmp_dir}/send_wal_errors_cnt_${dst_host0}_")
     if [ "$was_failed_cnt" -lt "$retry_count" ]; then
         current_dst_host="$dst_host0"
-    # having reached $retry_count, don’t try to write WAL to $dst_host0  during $cooldown_time seconds
-    # instead of it switch to  $dst_host1  during $cooldown_time seconds
+    # having reached $retry_count, don’t try to write WAL to $dst_host0 during $cooldown_time seconds
+    # instead of it switch to $dst_host1 during $cooldown_time seconds
     else
         now_time=$(date +%s)
         last_err_time=$(stat -c%Y "${tmp_dir}/send_wal_errors_cnt_${dst_host0}_")
@@ -140,8 +140,8 @@ else
     current_dst_host="$dst_host0"
 fi
 
-# set sync_host  parameter for archive_remote_cmd
-# if 1st is down, don’t sync to 2nd archive server
+# set sync_host parameter for archive_remote_cmd
+# if 1st is down, don’t sync to it
 if [ "$current_dst_host" = "$dst_host0" ]; then
     sync_host="$dst_host1"
 else
@@ -154,7 +154,7 @@ if [[ -r "$local_lastlog" ]]; then
 else
     prev_archived=""
 fi
-# files like  '000000010004EF04000000E1.00010DF0.backup' and '00000015.history'  are always archived together
+# files like '000000010004EF04000000E1.00010DF0.backup' and '00000015.history' are always archived together
 # compare only WAL
 # If previously archived file is not WAL, execute archiving procedure in one thread to make it possible to run a compare operation ('<')
 if is_wal "$fname" && is_wal "$prev_archived"; then

@@ -14,7 +14,7 @@ hostname=$(hostname)
 
 CWD=$(pwd) # save working dir for remote commands
 
-# оptions for rsync over ssh
+# options for rsync over ssh
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
 ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
 ssh_master_socket='/tmp/ssh_%h_%p_%r'

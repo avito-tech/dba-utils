@@ -50,14 +50,14 @@ AS $function$
 
      -- Function returns which backup must be executed by base-backup and mark it in table tasks as in progress (end_txtime = NULL).
      -- Backup script must mark successful backup by executing select * backups.stop(backup_id),
-     -- backip_id -  o_backip_id is an out parameter of that function.
+     -- backip_id - o_backip_id is an out parameter of that function.
      -- periodicity_days - periodicity(in days) of backup for specific(!) archive
 
      -- Returns 0 strings if there is no backup tasks for specific archive
      -- Backups are alternating between 2 archive servers.
      -- If previous backup was made to 1st archive server, then next will be made by 2nd archive server(and vice versa) if there is no crashes
      -- If the backup is failed on specific archive server, it will not being retried till
-     -- the row with failed status would be deleted(manually or by 'select * from backups.stop(backup_id)') from  backups.tasks
+     -- the row with failed status would be deleted(manually or by 'select * from backups.stop(backup_id)') from backups.tasks
      -- Meanwhile on second archive backups operations will continue being successfully executed
 
      -- RESTRICTIONS:
@@ -105,7 +105,7 @@ begin
     for v_host_r in select * from backups.hosts order by last_backup_start_txtime desc
     loop
         -- try to derive next archive server name (take the opposite one)
-        -- if there was fail on previous one, baskup still needs to be done
+        -- if there was fail on previous one, backup still needs to be done
         -- check existence failed backup task on opposite archive:
         perform * from
             backups.tasks t 
@@ -130,7 +130,7 @@ begin
             continue;
         end if;
         
-        -- if there is now such backup_id in tasksk, then chose that host
+        -- if there is no such backup_id in tasks, then chose that host
         if v_host_r.last_backup_id is NULL then
             v_is_found := true;
             exit;

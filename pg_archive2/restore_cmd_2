@@ -19,7 +19,7 @@ only_local=                # use WALs only from local_dir, do not read it from N
 src_hosts="$1" # ssh hosts
 buffer_dir=/var/lib/postgresql/wals_buffer      # first load file by ssh here, not tmpfs
 
-tmp_dir='/lib/init/rw/pg_recv_sb'               # file wiht error counter, created by puppet, tmpfs
+tmp_dir='/lib/init/rw/pg_recv_sb'               # file with error counter, created by puppet, tmpfs
 
 cmd_timeout="6"
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
@@ -91,7 +91,7 @@ apply_wal() {
     mv "$src_dir"/"$fname" "$dst_file"
     decompress_error=''
     if ! decompress "$dst_file"; then
-        # dst_file can be «destroyed» during decompress,
+        # dst_file can be "destroyed" during decompress,
         # that's why ignore possible error when delete it
         rm "$dst_file" || true
 
@@ -214,7 +214,8 @@ for host in $src_hosts ; do
 done
 received_from=$host
 
-# if can't connect to both hosts, then remove files counters of errors, то удаляем их файлы-счетчики ошибок,
+# if can't connect to both hosts, then remove files counters of errors,
+# so as not to "fall asleep" in vain and for a long time
 if [ "$conn_errors" -ge "$src_hosts_count" ]; then
     for host in $src_hosts ; do
         if [ -f "${tmp_dir}/ssh-errors_${host}_" ]; then

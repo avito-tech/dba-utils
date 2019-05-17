@@ -11,9 +11,9 @@ PGTOOLS=/usr/lib/postgresql/$PGVER/bin
 PG_ARCHIVECLEANUP_LOG_LOCAL="/var/tmp/wal-cleanup-pg_archivecleanup_LOCAL_${PGHOST}.log"
 PG_ARCHIVECLEANUP_LOG_REMOTE="/var/tmp/wal-cleanup-pg_archivecleanup_REMOTE_${PGHOST}.log"
 
-# опции для проверки последнего нужного wal на зеркалирующем archive хосте и удаленного cleanup
-cmd_timeout="1200"   # аргумент для утилиты timeout (ssh)
-cmd_cleanup_timeout=$((4 * 60 * 60))  # аргумент для утилиты timeout (ssh) при вызове pg_archivecleanup для непосредственно очистки
+# options for verify the last need WAL on the mirror archive host, and remote cleanup
+cmd_timeout="1200"   # timeout (ssh)
+cmd_cleanup_timeout=$((4 * 60 * 60))  # timeout (ssh) when pg_archivecleanup running for cleanup
 retry_cnt=1
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
 ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
@@ -76,7 +76,7 @@ main () {
     # check if backup_label on remote server exists and check that there is no ssh error
     no_remote_backup_label=$(timeout ${cmd_timeout} ssh $ssh_options $REMOTE_ARCHIVE "test -f \"$CWD/$SRC_DIR\"/backup_label || echo 'no backup label'")
     if [ "$no_remote_backup_label" = "no backup label" ]; then
-        # if  there is no backup_label, read LAST_NEEDED_WAL_OLDEST from local backup_label
+        # if there is no backup_label, read LAST_NEEDED_WAL_OLDEST from local backup_label
         echo "WARNING: backup_label at REMOTE host '$REMOTE_ARCHIVE' does not exist. No backups?"
         LAST_NEEDED_WAL_REMOTE="GGGGGGGGGGGGGGGGGGGGGGGG"
     else
