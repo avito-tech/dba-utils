@@ -58,7 +58,7 @@ send_wal() {
     local fname_with_path="$1"
     local file_name="$2"
     ftime=$(stat -c %y "$fname_with_path")
-    # compress only WAL files, skip compressing of  backup label и history  files
+    # compress only WAL files, skip compressing of backup label and history files
     if [[ "$file_name" == ???????????????????????? && -z "$remote_compress" ]]; then
         pbzip2 -1 -p"$pmax" < "$fname_with_path"
     else
@@ -68,7 +68,7 @@ send_wal() {
     /usr/local/bin/vmtouch -q -e "$fname_with_path"
 }
 
-# check the  existence of WAL file in the archive
+# check the existence of WAL file in the archive
 if [[ -r ${log_dir}/LASTLOG ]]; then
     prev_archived=$(< ${log_dir}/LASTLOG)
 else
@@ -88,7 +88,7 @@ fi
 ready_count=$(find ${arch_status_dir}/ -maxdepth 1 -type f -name "????????????????????????.ready" | wc -l)
 
 # single thread archive if:
-# - ready WAL files cnt is less than threshold “ready_wals_for_parallel “
+# - ready WAL files cnt is less than threshold "ready_wals_for_parallel"
 # - file is not WAL (.backup, .history)
 # - previous archived file is not WAL file
 if [[ $ready_count -le $ready_wals_for_parallel ]] || ! is_wal "$fname" || ! is_wal "$prev_archived"; then

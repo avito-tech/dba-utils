@@ -50,7 +50,7 @@ if [ -f "$dst_dir"/"$fname_org" ]; then
         touch --no-create --date "$ftime" "$tmp_dir"/"$fname_org".bad_md5 || true # ignore errors
         exit 1
     else
-        # if md5 values do not match, then exit without error
+        # if md5 values is equal, then exit without error
         echo "WARN: $dst_dir/$fname_org already exist with same md5"
         rm "$tmp_dir"/"$fname_org".dup
         exit 0
@@ -63,7 +63,7 @@ if [ -f "$dst_dir"/"$fname".tmp ]; then
 fi
 
 # to skip errors of recovering partial file
-# which is being archived (still in progress), let’s atomary create file in archive
+# which is being archived (still in progress), let’s atomically create file in archive
 # with the help of move
 if [[ $fname == ???????????????????????? && $remote_compress ]]; then
     cat > "$tmp_dir"/"$fname".new
@@ -82,7 +82,7 @@ fi
 touch --no-create --date "$ftime" "$dst_dir"/"$fname".tmp || true # ignore errors
 mv "$dst_dir"/"$fname".tmp "$dst_dir"/"$fname"
 
-#If 'coreutils-sync' is installed, fsync file and folder
+# if 'coreutils-sync' is installed, fsync file and folder
 if [ -f "/usr/local/bin/sync" ]; then
     /usr/local/bin/sync "$dst_dir"/"$fname"
     /usr/local/bin/sync "$dst_dir"
