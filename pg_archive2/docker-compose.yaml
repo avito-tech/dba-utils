@@ -1,0 +1,21 @@
+version: "2.3"
+services:
+
+  test:
+    hostname: test
+    image: "${IMAGE_NAME}"
+    command: test
+    volumes:
+      - "./:${APP_DIR}"
+
+  test-archive02:
+    hostname: test-archive02
+    image: "${IMAGE_NAME}"
+    volumes:
+      - "./:${APP_DIR}"
+
+  test-archive03:
+    hostname: test-archive03
+    image: "${IMAGE_NAME}"
+    volumes:
+      - "./:${APP_DIR}"

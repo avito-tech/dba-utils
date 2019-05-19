@@ -3,11 +3,10 @@
 Archive is an inherent part of resilient PostgreSQL infrastructure.
 
 This component is responsible for:
-
-- sending, receiving, storing, and rotating the WAL files.
-- backup tasks execution, queue with backup tasks, rotation of backups (validation of backup is not the part of Archive 2.0 and it is a standalone solution working on a different infrastructure).
+- sending, receiving, storing, and rotating the WAL files
+- backup tasks execution, queue with backup tasks, rotation of backups (validation of backup is not the part of Archive 2.0 and it is a standalone solution working on a different infrastructure)
 - PITR, recovery from backup (indirectly)
-- replication (As for Avito it is the majority of PostgreSQL clusters, apart from those using synchronous replication)
+- replication (as for Avito it is the majority of PostgreSQL clusters, apart from those using synchronous replication)
 
 One of the special features/advantages of Archive 2.0 comparing to other archive solutions is that it stores WAL files on two archive-servers simultaneously.
 
@@ -19,24 +18,23 @@ Log-shipping replication (without streaming) guarantees that archive is always i
 
 # Components
 
-- **Two archive servers** store the WAL files and backups.
-- **archive_cmd2** (archive command is set in postgresql.conf) transfers WAL and other files to either of the archive servers.
-- **archive_remote_cmd_2** - program which is executed on archive servers side, it gets the WALs, compress it and transfers them to the reserve archive server.
-- **restore_cmd_2** (recovery.conf) with its help standby gets WAL from archive servers.
-- **backup_queue** - database that stores backup schedule, backup settings and statuses for all backup tasks.
-- **base-backup_2** - program scheduled with cron (e.g. every 10 minutes). Checks if there is a backup task in the queue and executes it. It consists of: 
-  - **base-backup_2** - backup itself;
-  - **wal-cleanup_2** - cleaning of unnecessary WAL. The backup for them has been rotated (there is no backup to use these WAL files).
-  - **wal-sync** - bidirectional synchronisation/merge of archive servers.
-- **monitoring** - at least there should be monitoring of the backup queue and alerts for failed backup tasks.
- 
+- **two archive servers** store the WAL files and backups
+- **archive_cmd2** (archive command is set in postgresql.conf) transfers WAL and other files to either of the archive servers
+- **archive_remote_cmd_2** program which is executed on archive servers side, it gets the WALs, compress it and transfers them to the reserve archive server
+- **restore_cmd_2** (recovery.conf) with its help standby gets WAL from archive servers
+- **backup_queue** database that stores backup schedule, backup settings and statuses for all backup tasks
+- **base-backup_2** program scheduled with cron (e.g. every 10 minutes). Checks if there is a backup task in the queue and executes it. It consists of:
+  - **base-backup_2** backup itself
+  - **wal-cleanup_2** cleaning of unnecessary WAL. The backup for them has been rotated (there is no backup to use these WAL files)
+  - **wal-sync** bidirectional synchronisation/merge of archive servers
+- **monitoring** at least there should be monitoring of the backup queue and alerts for failed backup tasks
 
 # Examples
 
 Example of the archive_command setting:
 
 ```sh
-archive_command = '/usr/local/bin/archive_cmd_2 \'hostname_archive_1 hostname_archive_2\' /storage/archive_directory/ %p %f cluster_name' 
+archive_command = '/usr/local/bin/archive_cmd_2 \'hostname_archive_1 hostname_archive_2\' /storage/archive_directory/ %p %f cluster_name'
 ```
 
 Parameters description:
@@ -56,7 +54,7 @@ Pay attention to DST-DIR - it is the path on the archive server.
 ```
 *archive_cmd_2* transfers to the first DST-HOSTNAME, and then to the second one with the help of archive_remote_cmd_2 on remote host.
 
-*archive_remote_cmd*  writes WAL locally, compress it and tries to transfer the WAL to the SYNC-HOST.
+*archive_remote_cmd* writes WAL locally, compress it and tries to transfer the WAL to the SYNC-HOST.
 
 If *archive_cmd_2* can’t transfer the WAL to the first host (from parameters), then after N retries it starts to transfer WAL only to the second host during N seconds (cooldown_time):
 ```sh
@@ -64,4 +62,12 @@ retry_count="6"     # see below
 cooldown_time="600" # do not try to send file to $dst_host1 for a '$cooldown_time' seconds after '$retry_count' attempts
 ```
 
-For /etc/postgresql-common/compress.mime.mgc   compress.mime is used where only compressing signatures are left in order to exclude false positive runs (on other file types).
+For /etc/postgresql-common/compress.mime.mgc compress.mime is used where only compressing signatures are left in order to exclude false positive runs (on other file types).
+
+# Tests
+
+You need GNU `make`, `bash`, `docker` and `docker-compose`.
+```sh
+make NOTERM=''
+```
+Empty NOTERM for pretty bats output.
