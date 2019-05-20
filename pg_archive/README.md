@@ -1,16 +1,16 @@
-Архивирование WAL
+General description
 =================
 
-* archive_cmd — вызывается на мастере, архивирует и отправляет WAL через ssh
-* archive_remote_cmd — вызывается синхронно с мастера на сервере архива и принимает WAL
-* restore_cmd — вызывается на standby (recovery.conf) для получения WAL
+* archive_cmd — executes on primary, archives and sends WAL with the help of ssh
+* archive_remote_cmd — synchronously called on archive server from primary and receives WAL
+* restore_cmd — executes on standby (recovery.conf) for receiving the WAL for replay
 
-### Примеры использования
+### Examples
 
 ```sh
 archive_command = '/usr/local/bin/archive_cmd arch-host /mnt/nfs/wals_logs %p %f'
 restore_command = '/usr/local/bin/restore_cmd /mnt/nfs/wals_logs %f %p'
 
-# проигрывание из архива с задержкой в 2 дня (172800 секунд)
+# two-day (172800 seconds) delay of replaying the WAL from archive
 restore_command = '/usr/local/bin/restore_cmd /mnt/nfs/wals_logs %f %p 172800'
 ```

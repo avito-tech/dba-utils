@@ -11,8 +11,8 @@ BACKUP_DB_NAME="backup_db"
 BACKUP_DB_PORT=5432
 BACKUP_DB_USER="postgres"
 
-CMD_TIMEOUT="600"       # аргумент для утилиты timeout (psql)
-MY_HOSTNAME=$(hostname) # используется для взятия бэкапа (имя архивера)
+CMD_TIMEOUT="600"       # timeout (psql)
+MY_HOSTNAME=$(hostname) # archive server name
 LOCK_FILE="/var/tmp/base-backup.lock"
 BACKUPS_DIR=$1
 KEEP_BACKUPS=$2
@@ -30,8 +30,8 @@ function say() {
     echo $(date +'%F %T') "$@"
 }
 
-# flock whole script
-{
+# flock whole function
+function main() {
     flock -n 9 || exit 1
     { echo -n "$$ "; date +'%F %T'; } > "$LOCK_FILE"
 
@@ -207,6 +207,13 @@ EOF
     say > "$SUCCESS_FILE"
 
 } 9>> "$LOCK_FILE"
+
+# do not run on tests
+if [[ $BATS_TEST_FILENAME ]]; then
+    return
+fi
+
+main
 
 exit 0
 

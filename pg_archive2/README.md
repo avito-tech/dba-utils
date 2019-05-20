@@ -1,44 +1,43 @@
-# Общее описание
+# General description
 
-Архив представляет собой неотъемлемую часть *отказоустойчивой* инфраструктуры, связанной с Базами Данных PostgreSQL.
+Archive is an inherent part of resilient PostgreSQL infrastructure.
 
-Эта часть отвечает за:
+This component is responsible for:
+- sending, receiving, storing, and rotating the WAL files
+- backup tasks execution, queue with backup tasks, rotation of backups (validation of backup is not the part of Archive 2.0 and it is a standalone solution working on a different infrastructure)
+- PITR, recovery from backup (indirectly)
+- replication (as for Avito it is the majority of PostgreSQL clusters, apart from those using synchronous replication)
 
-- отправку, проигрывание, хранение, ротацию WAL.
-- очередь бэкапов, бэкапы, ротацию бэкапов (проверка бэкапов не входит в Archive 2.0 и представляет собой отдельную инфраструктуру).
-- PITR, восстановление из бэкапов (косвенно).
-- репликацию (в случае Avito, в большинстве кластеров БД, кроме тех, где есть синхронная streaming-репликация).
+One of the special features/advantages of Archive 2.0 comparing to other archive solutions is that it stores WAL files on two archive-servers simultaneously.
 
-Особенность Archive 2.0 в сравнении с другими системами заключается в том, что WAL хранятся сразу на двух архив-серверах (компоненты системы будут рассмотрены ниже).
+The archive infrastructure continues working If one of two archive servers becomes unreachable/unavailable. The gaps in WAL files will be filled with the help of syncing-WAL procedure, that is executed after each backup.
 
-При исчезновении доступа к одному из архив-серверов, система продолжает работать. "Дырки" в потоке WAL синхронизируются при каждом бэкапе.
+Backups are made in turn on both archive servers with the help of pg_basebackup. Thus there is a window for PITR (point in time recovery), the size of the recovery interval is set in a cluster settings. 
 
-Бэкапы выполняются по очереди на двух архиверах при помощи *pg_basebackup*. Всегда есть окно восстановления состояния БД из бэкапа на указанное в настройках кластера число дней до текущего момента (или момента падения мастера).
+Log-shipping replication (without streaming) guarantees that archive is always in future in relation to standby, it excludes loss of the data needed for PITR (gaps in WAL).
 
-При использовании archive-based репликации, гарантируется утверждение "архив всегда впереди standby", что исключает потерю данных, необходимых для PITR ("дырок" в потоке WAL).
-# Компоненты системы
+# Components
 
-- **два архив-сервера** - на них хранятся WAL'ы и бэкапы.
-- **archive_cmd2** - архив-команда для PostgreSQL конфига на мастер-сервере, отправляет WAL и другие файлы потока на один из двух доступных архив-серверов.
-- **archive_remote_cmd_2** - программа со стороны архив-серверов, которая принимает WAL и отправляет на второй "архивер" (он же архив-сервер).
-- **restore_cmd_2** - программа, отвечающая за проигрывание WAL на standby (указывается в recovery.conf).
-- **backup_queue** - база данных, в которой хранится саморегулируемое расписание бэкапов, настройки бэкапов и статусы завершения бэкапов.
-- **base-backup_2** - программа, запускаемая на архиверах по крону раз в 10 минут для "взятия" задачи бэкапа из очереди и выполнения самого бэкапа. Состоит из:
-- **base-backup_2** - сам скрипт
-- **wal-cleanup_2** - чистка ненужных WAL (не входящих ни в один хранящийся в данный момент времени бэкап).
-- **wal-sync** - синхронизация в обе стороны двух директорий с WAL, находящихся на двух разных серверах.
-- **restore_cmd_2**  - проигрывает WAL на standby с одного из двух доступных серверов-архиверов.
-- **мониторинг** - мониторится, как минимум, очередь бэкапов и срабатывают алерты при поломке одного из бэкапов.
+- **two archive servers** store the WAL files and backups
+- **archive_cmd2** (archive command is set in postgresql.conf) transfers WAL and other files to either of the archive servers
+- **archive_remote_cmd_2** program which is executed on archive servers side, it gets the WALs, compress it and transfers them to the reserve archive server
+- **restore_cmd_2** (recovery.conf) with its help standby gets WAL from archive servers
+- **backup_queue** database that stores backup schedule, backup settings and statuses for all backup tasks
+- **base-backup_2** program scheduled with cron (e.g. every 10 minutes). Checks if there is a backup task in the queue and executes it. It consists of:
+  - **base-backup_2** backup itself
+  - **wal-cleanup_2** cleaning of unnecessary WAL. The backup for them has been rotated (there is no backup to use these WAL files)
+  - **wal-sync** bidirectional synchronisation/merge of archive servers
+- **monitoring** at least there should be monitoring of the backup queue and alerts for failed backup tasks
 
-# Описание алгоритма "пути WAL" до архива
+# Examples
 
-Мастер-сервер выполняет из конфига archive_command вида:
+Example of the archive_command setting:
 
 ```sh
-archive_command = '/usr/local/bin/archive_cmd_2 \'hostname_archive_1 hostname_archive_2\' /storage/archive_directory/ %p %f cluster_name' 
+archive_command = '/usr/local/bin/archive_cmd_2 \'hostname_archive_1 hostname_archive_2\' /storage/archive_directory/ %p %f cluster_name'
 ```
 
-Описание аргументов:
+Parameters description:
 ```sh
  DST-HOSTNAMES              - two archive host names in single quotes
  DST-DIR                    - archive directory for WALs (ssh path)
@@ -46,21 +45,29 @@ archive_command = '/usr/local/bin/archive_cmd_2 \'hostname_archive_1 hostname_ar
  SRC-WAL-FILENAME           - %f (file name)
  CLUSTER-NAME               - unique cluster name
 ```
-Стоит обратить внимание на DST-DIR - это путь на **АРХИВ**-сервере.
+Pay attention to DST-DIR - it is the path on the archive server.
 
 
-*archive_cmd_2* отправляет wal'ы и сопутствующие файлы на два архив-хоста по схеме:
+*archive_cmd_2* transfers WAL’s and other files to both of the archive hosts in the following way:
 ```sh
 [ master: archive_cmd ] -> [ archive1: archive_remote_cmd ] -> [ archive2: scp ]
 ```
-*archive_cmd_2* пишет на первый из двух DST-HOSTNAME через archive_remote_cmd_2 на удаленном хосте.
+*archive_cmd_2* transfers to the first DST-HOSTNAME, and then to the second one with the help of archive_remote_cmd_2 on remote host.
 
-*archive_remote_cmd* (принимающая сторона на одном из архиверов) пишет WAL на себя и пытается отправить на SYNC-HOST.
+*archive_remote_cmd* writes WAL locally, compress it and tries to transfer the WAL to the SYNC-HOST.
 
-Если *archive_cmd_2* не удается записать WAL или другой файл на первый хост из аргумента, то через N попыток, команда начинать писать WAL'ы только на второй хост в течение N секунд (cooldown_time):
+If *archive_cmd_2* can’t transfer the WAL to the first host (from parameters), then after N retries it starts to transfer WAL only to the second host during N seconds (cooldown_time):
 ```sh
 retry_count="6"     # see below
-cooldown_time="600" # do not try to send file to $dst_host1 for a '$cooldown_time' seconds after '$retry_count' attemps
+cooldown_time="600" # do not try to send file to $dst_host1 for a '$cooldown_time' seconds after '$retry_count' attempts
 ```
 
-Для /etc/postgresql-common/compress.mime.mgc используется compress.mime в котором оставлены сигнатуры только утилит сжатия, что бы избежать ложных срабатываний (на другом типе файла).
+For /etc/postgresql-common/compress.mime.mgc compress.mime is used where only compressing signatures are left in order to exclude false positive runs (on other file types).
+
+# Tests
+
+You need GNU `make`, `bash`, `docker` and `docker-compose`.
+```sh
+make NOTERM=''
+```
+Empty NOTERM for pretty bats output.

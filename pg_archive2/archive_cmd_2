@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # archive_cmd
-# Отправляет wal'ы и сопутствующие файлы на два архив-хоста:
+# Transfers WALs to two archive hosts:
 # [ master: archive_cmd ] -> [ archive1: archive_remote_cmd ] -> [ archive2: scp ].
-# archive_cmd (этот скрипт) пишет на первый из двух DST-HOSTNAME через archive_remote_cmd на 
-# удаленном хосте.
-# archive_remote_cmd (принимающая сторона) пишет wal на себя и пытается отправить на SYNC-HOST.
-# Если archive_cmd не удается записать wal на первый хост через archive_remote_cmd, то после N попыток,
-# пишем на второй хост N секунд (cooldown_time).
+# archive_cmd writes on either of DST-HOSTNAMEs.
+# And with the help of archive_remote_cmd to remote host
+# archive_remote_cmd (on the 1st archive) saves WAL and tries to transfer WAL to SYNC-HOST.
+# If archive_cmd can't write WAL on first host with archive_remote_cmd,  then after N retries,
+# and continues to write on the second host during N seconds (cooldown_time).
 
 set -e
 set -o pipefail
@@ -19,19 +19,18 @@ error_handler() {
 }
 trap error_handler ERR
 
-pmax=4  # число потоков компрессора
+pmax=4  # the number of compressing threads
 remote_cmd=/usr/local/bin/archive_remote_cmd_2
-local_lastlog="/var/lib/postgresql/LASTLOG" # локальная копия файла с именем последнего успешно отправленного файла
+local_lastlog="/var/lib/postgresql/LASTLOG" # local copy of the file with the name of last successfully sent file
 
-cmd_timeout="6"   # аргумент для утилиты timeout (ssh и отправляющий cat/компрессор)
+cmd_timeout="6"   # parameter with timeout (for ssh/cat/compress)
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
 ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
 ssh_master_socket='/tmp/ssh_%h_%p_%r'
 ssh_master_options='-o ControlMaster=auto -o ControlPersist=yes'
 use_ssh_persist=yes
-remote_compress=yes  # сжимаем в archive_remote_cmd
 pwals=5
-ready_wals_for_parallel=10   # ready wals должен быть, как минимум, в два раза больше, чем pwals ?
+ready_wals_for_parallel=10   # ready-wals must be at least twice greater than pwals
 
 retry_count="6"     # see below
 cooldown_time="600" # do not try to send file to $dst_host1 for a '$cooldown_time' seconds after '$retry_count' attemps
@@ -68,10 +67,10 @@ if [ -z "$dst_hosts" -o -z "$dst_dir" -o -z "$src_file" -o -z "$fname" -o -z "$c
 fi
 
 dst_hosts_array=( $dst_hosts )
-dst_host0=${dst_hosts_array[0]} # первый хост из списка
-dst_host1=${dst_hosts_array[1]} # второй, резервный хост
+dst_host0=${dst_hosts_array[0]} # first host from list
+dst_host1=${dst_hosts_array[1]} # second (reserve) host
 
-# проверяет является ли имя файла именем wal
+# checks if file name is WAL name
 is_wal() {
     local fname="$1"
     if [[ "$fname" == ???????????????????????? ]] && [[ "$fname" != *.* ]]; then
@@ -81,31 +80,28 @@ is_wal() {
     fi
 }
 
-# отправляет файл на archive по ssh
+# transfers WAL to archive with ssh
 send_wal() {
     local fname_with_path="$1"
     local file_name="$2"
-    ftime=$(stat -c %y "$fname_with_path")
+    local dir=$dst_dir
+    local ftime fsize
+    IFS='|' read -r ftime fsize <<<"$(stat -c '%y|%s' "$fname_with_path")"
 
-    # LASTLOG кладём в другую директорию
+    # LASTLOG put in another catalog
     if [ "$file_name" = "LASTLOG" ]; then
-        # этот участок нельзя вызывать параллельно ни здесь, ни в remote_cmd
-        timeout ${cmd_timeout} cat "$local_lastlog" |\
-            timeout ${cmd_timeout} ssh $ssh_options "$current_dst_host" "$remote_cmd" "${dst_dir}/.." "LASTLOG" "'$ftime'" "'$remote_compress'" "$pmax" "$cluster_name" "$sync_host"
-        return 0
+        # this part can’t be executed in parallel neither here nor in remote_cmd
+        dir="${dst_dir}/.."
     fi
 
-    # проверить и архивировать только WAL, backup label и history пропускать без архивации
-    if [[ "$file_name" == ???????????????????????? && -z "$remote_compress" ]]; then
-        timeout ${cmd_timeout} pbzip2 -1 -p"$pmax" < "$fname_with_path"
-    else
-        timeout ${cmd_timeout} cat "$fname_with_path"
-    fi \
-        | timeout ${cmd_timeout} ssh $ssh_options "$current_dst_host" "$remote_cmd" "$dst_dir" "$file_name" "'$ftime'" "'$remote_compress'" "$pmax" "$cluster_name" "$sync_host"
+    timeout ${cmd_timeout} cat "$fname_with_path"                                   \
+        | timeout ${cmd_timeout} ssh $ssh_options "$current_dst_host" "$remote_cmd" \
+                  "$dir" "$file_name" "'$ftime'"                                    \
+                  "''" "$pmax" "$cluster_name"                                      \
+                  "'$sync_host'" "'$fsize'"
 }
 
-# инкрементирует в файле счетчик ошибок для хоста $dst_host0
-# $dst_host1 игнорируем
+# increments error counter for $dst_host0 in file (ignore $dst_host1)
 increment_wal_errors_cnt() {
     local was_failed_cnt
     [ "$current_dst_host" = "$dst_host1" ] && return 0
@@ -119,49 +115,48 @@ increment_wal_errors_cnt() {
     fi
 }
 
-# выставляем переменную $current_dst_host - на какой хост из двух отправляем файлы
-# в этом запуске скрипта
-# сначала проверяем нужно ли делать попытку отправки файла на $dst_host0 или отправлять сразу на $dst_host1
+# sets current $current_dst_host value to one on which to send files
+# first check if we should try to send file to $dst_host0 or directly send it to $dst_host1
 if [ -f "${tmp_dir}/send_wal_errors_cnt_${dst_host0}_" ]; then
     was_failed_cnt=$(<"${tmp_dir}/send_wal_errors_cnt_${dst_host0}_")
     if [ "$was_failed_cnt" -lt "$retry_count" ]; then
         current_dst_host="$dst_host0"
-    # при достижении $retry_count попыток, перестаем пытаться писать wal на хост $dst_host0 $cooldown_time секунд
-    # вместо этого переключаем отправку на следующий хост - $dst_host1 на $cooldown_time секунд
+    # having reached $retry_count, don’t try to write WAL to $dst_host0 during $cooldown_time seconds
+    # instead of it switch to $dst_host1 during $cooldown_time seconds
     else
         now_time=$(date +%s)
         last_err_time=$(stat -c%Y "${tmp_dir}/send_wal_errors_cnt_${dst_host0}_")
         if [[ $(( $now_time - $last_err_time)) -le $cooldown_time ]]; then
-            # попытаемся писать на dst_host1
+            # try to write to dst_host1
             current_dst_host="$dst_host1"
-        # начинаем заново пытаться писать на первый хост после $cooldown_time, сбросив счетчик ошибок хоста
+        # try to write to 1st host after $cooldown_time and reset error counter
         else
             rm "${tmp_dir}/send_wal_errors_cnt_${dst_host0}_"
             current_dst_host="$dst_host0"
         fi
     fi
 else
-    # файла с ошибками нет, значит шлём на первый
+    # there is no error file, so send to 1st host
     current_dst_host="$dst_host0"
 fi
 
-# выставляем sync_host (аргумент для archive_remote_cmd)
-# не синкаем на втророй архив-сервер если первый не доступен
+# set sync_host parameter for archive_remote_cmd
+# if 1st is down, don’t sync to it
 if [ "$current_dst_host" = "$dst_host0" ]; then
     sync_host="$dst_host1"
 else
     sync_host=''
 fi
 
-# проверим не отправлялся ли такой файл уже в архив (читаем локальный LASTLOG)
+# checks if that file has already been sent to archive by reading local LASTLOG
 if [[ -r "$local_lastlog" ]]; then
     prev_archived=$(< ${local_lastlog})
 else
     prev_archived=""
 fi
-# файлы вида '000000010004EF04000000E1.00010DF0.backup' и '00000015.history' архивируем всегда
-# сравниваем только wal
-# если предыдущий заархивированный файл не wal - архивируем в один поток (для корректного сравнения '<')
+# files like '000000010004EF04000000E1.00010DF0.backup' and '00000015.history' are always archived together
+# compare only WAL
+# If previously archived file is not WAL, execute archiving procedure in one thread to make it possible to run a compare operation ('<')
 if is_wal "$fname" && is_wal "$prev_archived"; then
     if [[ "$fname" < "$prev_archived" ]] || [[ "$fname" = "$prev_archived" ]]; then
         echo "File '$fname' was already sent to archive. Skipping..."
@@ -169,13 +164,13 @@ if is_wal "$fname" && is_wal "$prev_archived"; then
     fi
 fi
 
-# нужно ли выполнить параллельное архивирование? (отправка пачки wal в несколько потоков)
+# should we turn on multi thread archiving
 ready_count=$(find ${arch_status_dir}/ -maxdepth 1 -type f -name "????????????????????????.ready" | wc -l)
 
-# архивируем в один поток если:
-# - число готовых к архивации wal меньше порога ready_wals_for_parallel
-# - файл не является wal (.backup, .history)
-# - предыдущий заархивированный файл не является wal
+# archive with one thread if:
+# - ready WAL files number is lower than the threshold ready_wals_for_parallel
+# - it is not WAL file (.backup, .history)
+# - previously archived file is not WAL file
 if [[ $ready_count -le $ready_wals_for_parallel ]] || ! is_wal "$fname" || ! is_wal "$prev_archived"; then
     exit_code=0
     send_wal "$src_file" "$fname" || exit_code=$?
@@ -186,20 +181,20 @@ if [[ $ready_count -le $ready_wals_for_parallel ]] || ! is_wal "$fname" || ! is_
     fi
     wal=$fname
 else
-    # запускаем параллельное архивирвоание
+    # turn on parallel archiving
 
-    # возьем pwals файлов
+    # take pwals number of WAL files
     ready_wals=$(find ${arch_status_dir}/ -maxdepth 1 -type f -name "????????????????????????.ready" -printf '%f\n'\
                         | sort | grep -A "$(( pwals - 1 ))" -F ${fname})
 
-    # отправим эти wal параллельно
+    # archive these WAL files in parallel
     declare -A send_pids
     for wal_ready in $ready_wals ; do
         wal=${wal_ready%.ready}
         send_wal "$src_dir"/"$wal" "$wal" & send_pids[$wal]=$!
     done
 
-    # обработаем все коды выхода каждого потока
+    # check exit code for each thread
     for wal_pid in ${!send_pids[@]}; do
         exit_code=0
         wait ${send_pids[$wal_pid]} || exit_code=$?
@@ -211,9 +206,9 @@ else
     done
 fi
 
-# пишем LASTLOG локально
+# save LASTLOG locally
 echo "$wal" > "$local_lastlog"
-# пишем LASTLOG на удаленный сервер
+# send LASTLOG to remote server
 send_wal "$local_lastlog" "LASTLOG"
 
 exit 0

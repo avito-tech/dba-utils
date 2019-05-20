@@ -1,4 +1,6 @@
-﻿create table backups.hosts (
+create schema if not exists backups;
+
+create table backups.hosts (
   id serial primary key,
   host text not null,
   port int default 5432,
@@ -46,45 +48,44 @@ CREATE OR REPLACE FUNCTION backups.get_next(i_archiver text, OUT o_backip_id int
  LANGUAGE plpgsql
  ROWS 1
 AS $function$
-     -- Очередь бэкапов для бэкапа postgres-серверов на два архив-сервера (архивера) по очереди.
+     -- Backups queue for backup postgres servers to two archive servers in turn.
 
-     -- Процедура возвращает какой бэкап начать делать скрипту base-backup и помечает в тиблице tasks как начатый (end_txtime = NULL).
-     -- Скрипт, делающий бэкап, должен пометить бэкап как успешный, выполнив select * backups.stop(backup_id), 
-     -- где backip_id - возвращаемый из этой хранимки o_backip_id.
-     -- periodicity_days - периодичность бэкапа в днях для конкретного (!) архивера
+     -- Function returns which backup must be executed by base-backup and mark it in table tasks as in progress (end_txtime = NULL).
+     -- Backup script must mark successful backup by executing select * backups.stop(backup_id),
+     -- backip_id - o_backip_id is an out parameter of that function.
+     -- periodicity_days - periodicity(in days) of backup for specific(!) archive
 
-     -- Возвращает 0 строк если нет заданий в данный момент для текущего архивера.
-     -- Бэкапы чередуются между двумя и только двумя архиверами.
-     -- Если бэкап данного инстанса делался на 1-й архивер, то следующий бэкап пойдет на 2-й архивер (и наоборот) - если не было аварий
-     -- Если на одном из архиверов бэкап зафэйлился, он не будет выполняться на этом архивере до тех пор, пока
-     -- вручную не удалят строчку из backups.tasks с этим бэкапом в состоянии failed или хранимкой 'select * from backups.stop(backup_id)'
-     -- при этом, бэкап на второй сервер будет происходить с указанной периодичностью.
+     -- Returns 0 strings if there is no backup tasks for specific archive
+     -- Backups are alternating between 2 archive servers.
+     -- If previous backup was made to 1st archive server, then next will be made by 2nd archive server(and vice versa) if there is no crashes
+     -- If the backup is failed on specific archive server, it will not being retried till
+     -- the row with failed status would be deleted(manually or by 'select * from backups.stop(backup_id)') from backups.tasks
+     -- Meanwhile on second archive backups operations will continue being successfully executed
 
-     -- ОГРАНИЧЕНИЯ:
-     -- Первый бэкап должен запуститься на первом архивере, только тогда второй архивер сможет начать работу
+     -- RESTRICTIONS:
+     -- First backup must be run on the 1st archive server (second archive starts work only after 1st one)
 
 
-     -- ПРИМЕР добавления сервера в очередь бэкапа:
+     -- EXAMPLE of adding new cluster to backup queu:
         -- insert into backups.hosts (host, cluster_name, archiver_name, keep_backups_cnt, periodicity_days, directory) values
         --                 ('master7-sb', 'master7', '{"archive_1", "archive_2"}', 2, 4,  '/archive_path7/');
 
-     -- host             - standby, с которого бэкапим
-     -- cluster_name     - имя кластера (например, m7)
-     -- archiver_name    - массив из двух архиверов (на них делаем бэкап)
-     -- keep_backups_cnt - сколько бэкапов хранить на одном архивере. Рекомендуемое значение 2
-     -- periodicity_days - периодичность бэкапа в днях для одного (!) архивера. Рекомендуемое значение  - от 4 и кратное 2
-     -- directory        - директория, где хранятся бэкапы. Должна быть создана заранее.
+     -- host             - standby, from which backups will be taken
+     -- cluster_name     - cluster name (e.g. master7)
+     -- archiver_name    - array with two archive servers (destination of backup)
+     -- keep_backups_cnt - the number of backups to keep on one server (recommended value 2)
+     -- periodicity_days - schedule for one(!) archive server (recommended value 4 or more and it must be multiple of 2)
+     -- directory        - destination
 
 DECLARE
-    BACKUP_START_TIME constant time := '03:07'; -- стартовать бэкапы не раньше этого времени суток
+    BACKUP_START_TIME constant time := '03:07'; -- don't start backup befor this time
     v_host_r record;
     v_chosen_archiver text;
     v_is_found boolean := false;
     v_days_delimiter integer;
     v_expected_backup_date timestamptz;
 begin
-    -- Помечаем последние задания как зафэйленные, если между запусками backups.get_next() для текущего архивера не
-    -- выполнялось backups.done()
+    -- Mark backup tasks as failed if there was no backups.done() call between backups.get_next() for specific archive server
     update
         backups.tasks t
     set
@@ -102,12 +103,12 @@ begin
         raise notice '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!';
     end if;
  
-    -- очередь бэкапов
+    -- backup queue
     for v_host_r in select * from backups.hosts order by last_backup_start_txtime desc
     loop
-        -- вычислим следующий архивер (берем противоположный предыдущему)
-        -- но если предыдущий архивер зафэйлился, то бэкап все равно делаем
-        -- проверяем сломался ли бэкап для архивера противпололожному последнему:
+        -- try to derive next archive server name (take the opposite one)
+        -- if there was fail on previous one, backup still needs to be done
+        -- check existence failed backup task on opposite archive:
         perform * from
             backups.tasks t 
         where
@@ -117,34 +118,33 @@ begin
         order by
             start_txtime desc
         limit 1;
-        -- если он сломался, то выбираем архивер из поля last_archiver (бэкапимся на тот же архивер, что и в прошлый раз)
+        -- if failed then continue execute backup tasks on previous one archive server
         if found then
             v_chosen_archiver := v_host_r.last_archiver;
-            v_days_delimiter := 1; -- бэкапим на этот архивер каждые periodicity_days / v_days_multiplier дней
-        -- иначе выбираем противоположный тому, что указан в last_archiver (вычитание из массива)
+            v_days_delimiter := 1;
         else
             v_chosen_archiver := coalesce((array_remove(v_host_r.archiver_name, v_host_r.last_archiver))[1], v_host_r.archiver_name[1]);
-            v_days_delimiter := 2; -- чтобы бэкапиться на разные архиверы со сдвигом 
+            v_days_delimiter := 2;
         end if;
         
-        -- пропускаем, если аргумент хранимки не совпал с выбранным алгоритмом архивером
+        -- skip if input parameter does not match with reusult of function
         if i_archiver != v_chosen_archiver then
             continue;
         end if;
         
-        -- если в задачах нет такого backup_id, то выбираем этот хост
+        -- if there is no such backup_id in tasks, then chose that host
         if v_host_r.last_backup_id is NULL then
             v_is_found := true;
             exit;
         end if;
         perform * from backups.tasks t where t.backup_id = v_host_r.last_backup_id;
         if not found then
-            -- TODO: подумать как защититься от удаления строки в tasks
+            -- TODO: cope with deleting of row in tasks
             v_is_found := true;
             exit;
         end if;
 
-        -- проверяем завершился ли хоть один бэкап для этого хоста на выбранный архивер ошибкой
+        -- check for errors in backup tasks for chosen archive server
         perform *
         from
             backups.tasks t
@@ -155,16 +155,16 @@ begin
         order by 
             start_txtime desc
         limit 1;
-        -- пропускаем бэкап, пока ошибку не исправят и не удалят из tasks записи с ошибкой
+        -- skip backup execution till error will be fixed and record with error will be removed from tasks
         if found then
             continue;
         end if;
 
-        -- чтобы бэкапы чередовались правильно, v_days_multiplier зависит от того сломался ли позапрошлый бэкап или нет
-        -- например: если periodicity_days = 4, то, в целом, бэкапы будут идти каждые 2 дня, но на разные архиверы
-        -- но для каждого архивера в отдельности - это означает "бэкап раз в 4 дня"
+        -- v_days_multiplier dependency on before last backup task fail is done to alternate archives in right way
+        -- e.g.: if periodicity_days = 4, then backup will be made each 2 days on different archive servers
+        -- while on each archive server backup task is executed each 4 days
 
-        -- проверяем прошло ли нужное число дней с момента предыдущего бэкапа (periodicity_days) на данный архивер
+        -- check if periodicity_days are passed since last backup on that archive server
         v_expected_backup_date := v_host_r.last_backup_start_txtime::date + BACKUP_START_TIME + v_host_r.periodicity_days * '1 days'::interval / v_days_delimiter;
         -- raise notice 'DEBUG: v_expected_backup_date: %, v_days_delimiter: %', v_expected_backup_date, v_days_delimiter;
         perform *
@@ -182,7 +182,7 @@ begin
         end if;
     end loop;
 
-    -- выходим с ошибкой если в цикле не нашли подходящего кандидата для бэкапа
+    -- exit with error if don't find appropriate backup candidate
     if v_is_found = false then
         -- raise notice 'there is no tasks for ''%''', i_archiver;
         return;
@@ -194,17 +194,17 @@ begin
     o_backups_dir := v_host_r.directory;
     o_bareos_on := v_host_r.bareos_on;
 
-    -- выбираем хост для зеркалирования (wal-sync, wal-cleanup)
+    -- choose host for syncing (wal-sync, wal-cleanup)
     select (array_remove(v_host_r.archiver_name, v_chosen_archiver))[1] into o_remote_archiver from backups.hosts h;
 
-    -- вставляем в tasks строчку о задании
+    -- add record with backup task
     insert into backups.tasks
         (host, archiver_name, start_txtime, end_txtime)
     values
         (v_host_r.host, v_chosen_archiver, now(), NULL)
     returning backup_id into o_backip_id;
 
-    -- обновим состояние в hosts
+    -- update hosts status
     update backups.hosts set last_archiver = v_chosen_archiver, last_backup_start_txtime = now(), last_backup_id = o_backip_id where host = v_host_r.host;
 
     return next;
@@ -220,7 +220,7 @@ CREATE OR REPLACE FUNCTION backups.stop(i_backup_id integer, OUT o_info boolean)
  RETURNS boolean
  LANGUAGE plpgsql
 AS $function$
-     -- Помечает backup_id взятый из функции backups.i_archiver() как завершившийся успешно
+     -- mark backup_id (which was get by backups.i_archiver()) as successful
 DECLARE
 begin
     o_info := false;

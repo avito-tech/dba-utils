@@ -1,20 +1,20 @@
 #!/bin/bash
 
 # wal-sync
-# синхронизирует wal'ы между двумя архив-серверами
+# synchronize WAL between two archives
 
 WALS_DIR=$1
 REMOTE_ARCHIVE=$2
 LOCK_FILE_NAME=sync-archives.lock
 LOG_FILE="/var/tmp/wal-sync_${PGHOST}.log"
-RSYNC_LOG_OUT="/var/tmp/wal-sync_OUT_${PGHOST}" # rsync с этого сервера на удаленный
-RSYNC_LOG_IN="/var/tmp/wal-sync_IN_${PGHOST}"   # rsync на этот сервер с удаленного
+RSYNC_LOG_OUT="/var/tmp/wal-sync_OUT_${PGHOST}" # rsync from that server to remote
+RSYNC_LOG_IN="/var/tmp/wal-sync_IN_${PGHOST}"   # rsync to that server from remote
 
 hostname=$(hostname)
 
 CWD=$(pwd) # save working dir for remote commands
 
-# опции для rsync over ssh
+# options for rsync over ssh
 ssh_timeout_options="-o ConnectTimeout=10 -o ServerAliveInterval=6 -o ServerAliveCountMax=5"
 ssh_options="-o Compression=no -c aes128-gcm@openssh.com -o BatchMode=yes ${ssh_timeout_options}"
 ssh_master_socket='/tmp/ssh_%h_%p_%r'
